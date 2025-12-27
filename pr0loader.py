@@ -18,7 +18,7 @@ logging.basicConfig(
 )
 
 # Global configuration variables
-REQUIRED_CONFIG_KEYS = ['ME', 'CONSENT', 'MONGODB_STRING', 'FILESYSTEM_PREFIX']
+REQUIRED_CONFIG_KEYS = ['PP', 'CONSENT', 'MONGODB_STRING', 'FILESYSTEM_PREFIX']
 CONTENT_FLAGS = 15  # Adjust as needed
 HTTP_MAX_TRIES = 100
 HTTP_TIMEOUT = 30
@@ -73,7 +73,7 @@ def setup_http_session(config: dict) -> requests.Session:
     session = requests.Session()
     cookies = {
         'me': config['ME'],
-        'euconsent-v2': config['CONSENT']
+        'pp': config['PP']
     }
     session.cookies.update(cookies)
     return session
