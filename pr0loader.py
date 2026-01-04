@@ -18,7 +18,7 @@ logging.basicConfig(
 )
 
 # Global configuration variables
-REQUIRED_CONFIG_KEYS = ['PP', 'CONSENT', 'MONGODB_STRING', 'FILESYSTEM_PREFIX']
+REQUIRED_CONFIG_KEYS = ['PP', 'ME', 'MONGODB_STRING', 'FILESYSTEM_PREFIX']
 CONTENT_FLAGS = 15  # Adjust as needed
 HTTP_MAX_TRIES = 100
 HTTP_TIMEOUT = 30
@@ -153,7 +153,7 @@ def get_min_db_id(collection: Collection) -> int:
     Returns:
         int: The minimum item ID, or -1 if not found.
     """
-    return get_db_item_id([('id', 1)], collection)
+    return get_db_item_id([('id', -1)], collection)
 
 
 def get_max_db_id(collection: Collection) -> int:
@@ -206,14 +206,13 @@ def determine_id_range(collection: Collection, session: requests.Session, full_u
         Tuple[int, int]: A tuple containing the start ID and end ID.
     """
     highest_remote_id = fetch_highest_remote_id(session)
-
-    if start_from:
-        logging.info(f"START_FROM is set. Start preset to {start_from}")
-        return start_from, 1
-    elif full_update:
+    if full_update:
         # Process all items from highest remote ID down to ID 1
         logging.info("FULL_UPDATE is enabled. Processing all items.")
         return highest_remote_id, 1
+    elif start_from:
+        logging.info(f"START_FROM is set. Start preset to {start_from}")
+        return start_from, 1
     else:
         # Proceed with the existing logic
         min_db_id = get_min_db_id(collection)
