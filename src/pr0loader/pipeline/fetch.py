@@ -2,10 +2,12 @@
 
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
 
 from pr0loader.api import APIClient
 from pr0loader.config import Settings
-from pr0loader.models import PipelineStats
+from pr0loader.models import PipelineStats, Item
 from pr0loader.storage import SQLiteStorage
 from pr0loader.utils.console import (
     create_progress,
@@ -14,7 +16,6 @@ from pr0loader.utils.console import (
     print_success,
     print_info,
     print_warning,
-    is_headless,
 )
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,71 @@ class FetchPipeline:
         self.settings = settings
         self.api = APIClient(settings)
         self.stats = PipelineStats()
+
+    def _fetch_item_info(self, item: Item) -> Optional[Item]:
+        """
+        Fetch detailed info (tags, comments) for a single item.
+
+        Returns:
+            Item with populated tags and comments, or None if failed.
+        """
+        try:
+            info = self.api.get_item_info(item.id)
+            item.tags = info.tags
+            item.comments = info.comments
+
+            # Verbose logging: show item details
+            if logger.isEnabledFor(logging.DEBUG):
+                tag_names = [t.tag for t in item.tags[:5]]  # First 5 tags
+                tag_str = ", ".join(tag_names) if tag_names else "no tags"
+                logger.debug(
+                    f"Item {item.id}: {item.image} | "
+                    f"👍{item.up} 👎{item.down} | "
+                    f"Tags: {tag_str}"
+                )
+
+            return item
+        except Exception as e:
+            logger.error(f"Failed to fetch info for item {item.id}: {e}")
+            return None
+
+    def _fetch_batch_info_parallel(self, items: list[Item]) -> list[Item]:
+        """
+        Fetch detailed info for multiple items in parallel.
+
+        Args:
+            items: List of items to fetch info for
+
+        Returns:
+            List of successfully processed items with tags and comments
+        """
+        successful_items = []
+        max_workers = self.settings.max_parallel_requests
+
+        logger.debug(f"Fetching info for {len(items)} items with {max_workers} parallel workers")
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all fetch tasks
+            future_to_item = {
+                executor.submit(self._fetch_item_info, item): item
+                for item in items
+            }
+
+            # Process completed tasks as they finish
+            for future in as_completed(future_to_item):
+                item = future_to_item[future]
+                try:
+                    result = future.result()
+                    if result is not None:
+                        successful_items.append(result)
+                        self.stats.items_processed += 1
+                    else:
+                        self.stats.items_failed += 1
+                except Exception as e:
+                    logger.error(f"Exception while processing item {item.id}: {e}")
+                    self.stats.items_failed += 1
+
+        return successful_items
 
     def determine_id_range(self, storage: SQLiteStorage) -> tuple[int, int]:
         """Determine the range of IDs to fetch."""
@@ -69,12 +135,18 @@ class FetchPipeline:
 
             print_info(f"Fetching items from ID {start_id} down to {end_id}")
             print_info(f"Estimated items: ~{estimated_items:,}")
+            print_info(f"Parallel workers: {self.settings.max_parallel_requests}")
 
             current_id = start_id
             batch = []  # Accumulate items for batch insert
             batch_size = self.settings.db_batch_size
 
+            # Track database write performance
+            total_db_write_time = 0.0
+            db_write_count = 0
+
             logger.info(f"Using batch size: {batch_size} items per commit")
+            logger.info(f"Using {self.settings.max_parallel_requests} parallel workers for metadata fetching")
             print_info(f"DB batch size: {batch_size} items")
 
             progress = create_progress("Fetching")
@@ -86,45 +158,34 @@ class FetchPipeline:
 
                 while True:
                     try:
-                        # Fetch batch of items
+                        # Fetch batch of items (basic info only)
                         response = self.api.get_items(older_than=current_id)
 
                         if not response.items:
                             logger.info("No more items to fetch")
                             break
 
-                        # Process each item
-                        for item in response.items:
-                            try:
-                                # Fetch detailed info (tags, comments)
-                                info = self.api.get_item_info(item.id)
-                                item.tags = info.tags
-                                item.comments = info.comments
+                        # Fetch detailed info (tags, comments) for all items in parallel
+                        logger.debug(f"Fetching detailed info for {len(response.items)} items in parallel")
+                        processed_items = self._fetch_batch_info_parallel(response.items)
 
-                                # Verbose logging: show item details
-                                if logger.isEnabledFor(logging.DEBUG):
-                                    tag_names = [t.tag for t in item.tags[:5]]  # First 5 tags
-                                    tag_str = ", ".join(tag_names) if tag_names else "no tags"
-                                    logger.debug(
-                                        f"Item {item.id}: {item.image} | "
-                                        f"👍{item.up} 👎{item.down} | "
-                                        f"Tags: {tag_str}"
-                                    )
+                        # Add successfully processed items to batch
+                        batch.extend(processed_items)
 
-                                # Add to batch
-                                batch.append(item)
-                                self.stats.items_processed += 1
-                                progress.update(task, advance=1)
+                        # Update progress
+                        progress.update(task, advance=len(response.items))
 
-                                # Flush batch to database when it reaches batch_size
-                                if len(batch) >= batch_size:
-                                    storage.upsert_items_batch(batch)
-                                    logger.debug(f"Flushed batch of {len(batch)} items to DB")
-                                    batch = []
+                        # Flush batch to database when it reaches batch_size
+                        if len(batch) >= batch_size:
+                            write_start = time.time()
+                            storage.upsert_items_batch(batch)
+                            write_time = time.time() - write_start
+                            total_db_write_time += write_time
+                            db_write_count += 1
 
-                            except Exception as e:
-                                logger.error(f"Failed to process item {item.id}: {e}")
-                                self.stats.items_failed += 1
+                            logger.debug(f"Flushed batch of {len(batch)} items to DB in {write_time:.2f}s")
+                            batch = []
+
 
                         # Get next page
                         next_id = response.items[-1].id if response.items else None
@@ -143,14 +204,28 @@ class FetchPipeline:
 
                 # Flush any remaining items in the batch
                 if batch:
+                    write_start = time.time()
                     storage.upsert_items_batch(batch)
-                    logger.debug(f"Flushed final batch of {len(batch)} items to DB")
+                    write_time = time.time() - write_start
+                    total_db_write_time += write_time
+                    db_write_count += 1
+                    logger.debug(f"Flushed final batch of {len(batch)} items to DB in {write_time:.2f}s")
+
+            # Optimize database after bulk inserts
+            print_info("Optimizing database...")
+            storage.optimize_database()
+
+            # Calculate and log performance stats
+            avg_write_time = total_db_write_time / db_write_count if db_write_count > 0 else 0
+            logger.info(f"Database write performance: {db_write_count} batches, "
+                       f"total {total_db_write_time:.2f}s, avg {avg_write_time:.2f}s per batch")
 
             # Print final stats
             print_stats_table("Fetch Results", {
                 "Items processed": self.stats.items_processed,
                 "Items failed": self.stats.items_failed,
                 "Total in database": storage.get_item_count(),
+                "DB write time": f"{total_db_write_time:.1f}s ({db_write_count} batches)",
             })
 
             print_success("Fetch complete!")

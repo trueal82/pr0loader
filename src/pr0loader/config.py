@@ -85,13 +85,17 @@ class Settings(BaseSettings):
     request_timeout: int = Field(default=30, description="Request timeout in seconds")
     max_backoff_seconds: int = Field(default=300, description="Maximum backoff time")
     request_delay: float = Field(default=1.0, description="Delay between requests")
+    max_parallel_requests: int = Field(
+        default=20,
+        description="Maximum number of parallel metadata requests (for fetch pipeline). Higher = faster on multi-core systems"
+    )
 
     # Processing
     full_update: bool = Field(default=False, description="Perform full update")
     start_from: Optional[int] = Field(default=None, description="Start from specific ID")
     db_batch_size: int = Field(
-        default=200,
-        description="Number of items to batch before committing to database (higher = faster but more RAM)"
+        default=2000,
+        description="Number of items to batch before committing to database (higher = faster but more RAM, recommended: 500-5000 depending on available RAM)"
     )
 
     # Dataset preparation

@@ -191,7 +191,7 @@ class TrainPipeline:
 
         callbacks = [
             keras.callbacks.ModelCheckpoint(
-                filepath=str(self.settings.checkpoint_dir / 'ckpt_{epoch}'),
+                filepath=str(self.settings.checkpoint_dir / 'ckpt_{epoch}.weights.h5'),
                 save_weights_only=True,
                 save_freq='epoch'
             ),

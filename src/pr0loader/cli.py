@@ -92,6 +92,7 @@ def check_setup(headless: bool = False) -> bool:
 def check_auth_for_content_flags(settings: "Settings", headless: bool = False) -> bool:
     """
     Check if authentication is available when content flags require it.
+    Also loads stored credentials into settings if available.
 
     Content flags > 1 means non-SFW content, which requires authentication.
 
@@ -102,19 +103,23 @@ def check_auth_for_content_flags(settings: "Settings", headless: bool = False) -
     if settings.content_flags == 1:
         return True
 
-    # Check if we have cookies in settings
+    # Check if we have cookies in settings already
     if settings.pp and settings.me:
         return True
 
-    # Check if we have stored credentials
+    # Check if we have stored credentials and load them into settings
     try:
         from pr0loader.auth import get_auth_manager
         auth = get_auth_manager()
         creds = auth.store.load()
         if creds and creds.is_valid():
+            # IMPORTANT: Load credentials into settings so APIClient can use them
+            settings.pp = creds.pp
+            settings.me = creds.me
+            print_info(f"Using stored credentials for user: {creds.username}")
             return True
-    except Exception:
-        pass
+    except Exception as e:
+        pass  # Silently continue if credentials can't be loaded
 
     # No auth available
     if headless:
@@ -1632,7 +1637,7 @@ def version():
 @app.command("e2e-test")
 def e2e_test(
     ctx: typer.Context,
-    limit: int = typer.Option(1000, "--limit", "-l", help="Number of images to use (dev mode)"),
+    limit: int = typer.Option(100000, "--limit", "-l", help="Number of images to use (dev mode)"),
     skip_fetch: bool = typer.Option(False, "--skip-fetch", help="Skip fetch step"),
     skip_download: bool = typer.Option(False, "--skip-download", help="Skip download step"),
     train_ratio: float = typer.Option(0.8, "--train-ratio", "-r", help="Train/test split ratio"),
@@ -1652,11 +1657,24 @@ def e2e_test(
     """
     headless = ctx.obj.get("headless", False)
 
-    # Configure logging for verbose mode
+    # Configure logging for verbose mode - reconfigure to enable DEBUG level
     if verbose:
-        setup_logging(verbose=True, headless=headless)
+        # Reconfigure the entire logging system for verbose mode
+        root_logger = logging.getLogger()
+        root_logger.setLevel(logging.DEBUG)
+
+        # Update all existing handlers to DEBUG level
+        for handler in root_logger.handlers:
+            handler.setLevel(logging.DEBUG)
+
+        # Also enable DEBUG for all pr0loader loggers
+        for name in ['pr0loader', 'pr0loader.pipeline', 'pr0loader.storage', 'pr0loader.api']:
+            logging.getLogger(name).setLevel(logging.DEBUG)
+
         logger = logging.getLogger(__name__)
-        logger.info("Verbose mode enabled")
+        logger.debug("Verbose mode enabled - DEBUG logging active")
+        logger.debug(f"Root logger level: {logging.getLogger().level}")
+        logger.debug(f"Handlers: {len(logging.getLogger().handlers)}")
 
     if not headless:
         show_banner()
@@ -1678,21 +1696,44 @@ def e2e_test(
         print_info(f"Content: SFW only (no auth required)")
         print_info(f"Train/test split: {train_ratio:.0%} / {(1-train_ratio):.0%}")
         if verbose:
-            print_info("Verbose logging enabled")
+            print_info("Verbose logging enabled - you should see DEBUG logs below")
+            # Test that logging is actually working
+            test_logger = logging.getLogger('pr0loader.pipeline.fetch')
+            test_logger.debug("TEST: Verbose mode is working! You should see detailed logs for each operation.")
         console.print()
 
-        total_steps = 5 - (1 if skip_fetch else 0) - (1 if skip_download else 0)
+        # Check if we already have enough data
+        existing_items = 0
+        should_fetch = not skip_fetch
+        should_download = not skip_download
+
+        if settings.db_path.exists():
+            try:
+                from pr0loader.storage import SQLiteStorage
+                with SQLiteStorage(settings.db_path) as storage:
+                    existing_items = storage.get_item_count()
+                    print_info(f"Database contains {existing_items} items")
+
+                    if existing_items >= limit:
+                        print_success(f"✓ Already have {existing_items} items (need {limit})")
+                        should_fetch = False
+                        should_download = False
+                        print_info("Skipping fetch and download steps")
+            except Exception as e:
+                print_warning(f"Could not check database: {e}")
+
+        total_steps = 5 - (0 if should_fetch else 1) - (0 if should_download else 1)
         current_step = 0
 
         # Step 1: Fetch (optional)
-        if not skip_fetch:
+        if should_fetch:
             current_step += 1
             console.print(f"\n[bold cyan]═══ Step {current_step}/{total_steps}: Fetch Metadata ═══[/bold cyan]")
             from pr0loader.pipeline import FetchPipeline
             FetchPipeline(settings).run()
 
         # Step 2: Download (optional)
-        if not skip_download:
+        if should_download:
             current_step += 1
             console.print(f"\n[bold cyan]═══ Step {current_step}/{total_steps}: Download Images ═══[/bold cyan]")
             from pr0loader.pipeline import DownloadPipeline

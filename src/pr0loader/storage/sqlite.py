@@ -19,12 +19,85 @@ class SQLiteStorage:
         self.conn: Optional[sqlite3.Connection] = None
 
     def connect(self):
-        """Connect to the database."""
+        """Connect to the database with performance optimizations."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.db_path))
         self.conn.row_factory = sqlite3.Row
+
+        # Apply performance optimizations
+        self._optimize_connection()
         self._init_schema()
         logger.info(f"Connected to database: {self.db_path}")
+
+    def _optimize_connection(self):
+        """Apply SQLite performance optimizations."""
+        cursor = self.conn.cursor()
+
+        try:
+            # WAL mode: allows concurrent reads during writes, much faster
+            # Note: WAL may not work on all filesystems (e.g., network drives, some WSL setups)
+            result = cursor.execute('PRAGMA journal_mode=WAL').fetchone()
+            if result and result[0] != 'wal':
+                logger.warning(f"Could not enable WAL mode, using {result[0]} instead. Performance may be reduced.")
+                logger.warning("This can happen on network drives or certain filesystems.")
+        except Exception as e:
+            logger.warning(f"Failed to set WAL mode: {e}. Continuing with default journal mode.")
+
+        # Synchronous NORMAL: balanced performance/safety (not FULL which is very slow)
+        # NORMAL is safe for WAL mode and much faster than FULL
+        try:
+            cursor.execute('PRAGMA synchronous=NORMAL')
+        except Exception as e:
+            logger.warning(f"Failed to set synchronous mode: {e}")
+
+        # Increase cache size to 512MB for systems with lots of RAM (default is ~2MB)
+        # This is CRUCIAL for RAID5 HDDs - keeps more data in memory to reduce writes
+        # Negative value = KB, so -524288 = 512MB
+        try:
+            cursor.execute('PRAGMA cache_size=-524288')
+        except Exception as e:
+            logger.warning(f"Failed to set cache size: {e}")
+
+        # Page size can ONLY be set before any tables exist
+        # Check if database is new (no tables yet)
+        try:
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' LIMIT 1")
+            has_tables = cursor.fetchone() is not None
+
+            if not has_tables:
+                # New database - we can set page size
+                cursor.execute('PRAGMA page_size=4096')
+                logger.debug("Set page size to 4096 (new database)")
+            else:
+                # Existing database - cannot change page size
+                logger.debug("Skipping page_size setting (existing database)")
+        except Exception as e:
+            logger.warning(f"Failed to check/set page size: {e}")
+
+        # Memory-mapped I/O for faster reads (1GB for systems with plenty of RAM)
+        try:
+            cursor.execute('PRAGMA mmap_size=1073741824')
+        except Exception as e:
+            logger.warning(f"Failed to set mmap_size: {e}")
+
+        # Temp storage in memory for faster sorting/indexing
+        try:
+            cursor.execute('PRAGMA temp_store=MEMORY')
+        except Exception as e:
+            logger.warning(f"Failed to set temp_store: {e}")
+
+        # Set temp cache to 256MB for large operations
+        try:
+            cursor.execute('PRAGMA temp_cache_size=-262144')
+        except Exception as e:
+            logger.warning(f"Failed to set temp_cache_size: {e}")
+
+        try:
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Failed to commit pragma settings: {e}")
+
+        logger.debug("SQLite performance optimizations applied")
 
     def close(self):
         """Close the database connection."""
@@ -71,18 +144,8 @@ class SQLiteStorage:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_items_promoted ON items(promoted)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_items_image ON items(image)')
 
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS tags (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                item_id INTEGER,
-                tag TEXT,
-                confidence REAL,
-                FOREIGN KEY (item_id) REFERENCES items(id)
-            )
-        ''')
-
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_item ON tags(item_id)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag)')
+        # Note: tags table removed - tags are stored in tags_data JSON column
+        # and extracted during prepare step when needed
 
         self.conn.commit()
 
@@ -110,13 +173,6 @@ class SQLiteStorage:
             item.user, item.mark, item.gift, item_json, tags_json, comments_json
         ))
 
-        # Update tags table
-        cursor.execute('DELETE FROM tags WHERE item_id = ?', (item.id,))
-        for tag in item.tags:
-            cursor.execute(
-                'INSERT INTO tags (item_id, tag, confidence) VALUES (?, ?, ?)',
-                (item.id, tag.tag, tag.confidence)
-            )
 
         if commit:
             self.conn.commit()
@@ -135,49 +191,41 @@ class SQLiteStorage:
 
         cursor = self.conn.cursor()
 
-        # Prepare batch data
-        items_data = []
-        tags_to_delete = []
-        tags_data = []
+        # Begin an immediate transaction to lock the database early
+        cursor.execute('BEGIN IMMEDIATE')
 
-        for item in items:
-            tags_json = json.dumps([t.model_dump() for t in item.tags])
-            comments_json = json.dumps([c.model_dump() for c in item.comments])
-            item_json = json.dumps(item.model_dump(exclude={'tags', 'comments'}))
+        try:
+            # Prepare batch data
+            items_data = []
 
-            items_data.append((
-                item.id, item.image, item.promoted, item.up, item.down, item.created,
-                item.width, item.height, item.audio, item.source, item.flags,
-                item.user, item.mark, item.gift, item_json, tags_json, comments_json
-            ))
+            for item in items:
+                tags_json = json.dumps([t.model_dump() for t in item.tags])
+                comments_json = json.dumps([c.model_dump() for c in item.comments])
+                item_json = json.dumps(item.model_dump(exclude={'tags', 'comments'}))
 
-            tags_to_delete.append(item.id)
-            for tag in item.tags:
-                tags_data.append((item.id, tag.tag, tag.confidence))
+                items_data.append((
+                    item.id, item.image, item.promoted, item.up, item.down, item.created,
+                    item.width, item.height, item.audio, item.source, item.flags,
+                    item.user, item.mark, item.gift, item_json, tags_json, comments_json
+                ))
 
-        # Execute batch inserts
-        cursor.executemany('''
-            INSERT OR REPLACE INTO items
-            (id, image, promoted, up, down, created, width, height, audio, source,
-             flags, user_name, mark, gift, item_data, tags_data, comments_data, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
-        ''', items_data)
+            # Execute batch insert - tags are already in tags_data JSON column
+            cursor.executemany('''
+                INSERT OR REPLACE INTO items
+                (id, image, promoted, up, down, created, width, height, audio, source,
+                 flags, user_name, mark, gift, item_data, tags_data, comments_data, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+            ''', items_data)
 
-        # Delete old tags for all items
-        if tags_to_delete:
-            placeholders = ','.join('?' * len(tags_to_delete))
-            cursor.execute(f'DELETE FROM tags WHERE item_id IN ({placeholders})', tags_to_delete)
+            # Commit the transaction
+            self.conn.commit()
+            logger.debug(f"Batch upserted {len(items)} items")
 
-        # Insert new tags
-        if tags_data:
-            cursor.executemany(
-                'INSERT INTO tags (item_id, tag, confidence) VALUES (?, ?, ?)',
-                tags_data
-            )
-
-        # Single commit for entire batch
-        self.conn.commit()
-        logger.debug(f"Batch upserted {len(items)} items")
+        except Exception as e:
+            # Rollback on error
+            self.conn.rollback()
+            logger.error(f"Error during batch upsert: {e}")
+            raise
 
     def get_min_id(self) -> int:
         """Get the minimum item ID."""
@@ -198,6 +246,18 @@ class SQLiteStorage:
         cursor = self.conn.cursor()
         cursor.execute('SELECT COUNT(*) as count FROM items')
         return cursor.fetchone()['count']
+
+    def optimize_database(self):
+        """Optimize the database by running ANALYZE and optional VACUUM.
+
+        ANALYZE updates statistics for query optimizer.
+        Should be called after large batch operations.
+        """
+        logger.info("Optimizing database (running ANALYZE)...")
+        cursor = self.conn.cursor()
+        cursor.execute('ANALYZE')
+        self.conn.commit()
+        logger.info("Database optimization complete")
 
     def get_item(self, item_id: int) -> Optional[Item]:
         """Get an item by ID."""
@@ -285,20 +345,35 @@ class SQLiteStorage:
             offset += batch_size
 
     def get_all_unique_tags(self) -> list[str]:
-        """Get all unique tag names."""
+        """Get all unique tag names from tags_data JSON column."""
         cursor = self.conn.cursor()
-        cursor.execute('SELECT DISTINCT tag FROM tags ORDER BY tag')
-        return [row['tag'] for row in cursor.fetchall()]
+        cursor.execute('SELECT DISTINCT tags_data FROM items WHERE tags_data IS NOT NULL')
 
-    def get_tag_counts(self, limit: int = 100) -> list[tuple[str, int]]:
-        """Get most common tags with counts."""
+        unique_tags = set()
+        for row in cursor.fetchall():
+            tags = json.loads(row['tags_data'] or '[]')
+            for tag_obj in tags:
+                unique_tags.add(tag_obj['tag'])
+
+        return sorted(list(unique_tags))
+
+    def get_tag_counts(self, limit: Optional[int] = 100) -> list[tuple[str, int]]:
+        """Get most common tags with counts from tags_data JSON column.
+
+        Args:
+            limit: Maximum number of tags to return. If None, returns all tags.
+        """
         cursor = self.conn.cursor()
-        cursor.execute('''
-            SELECT tag, COUNT(*) as count 
-            FROM tags 
-            GROUP BY tag 
-            ORDER BY count DESC 
-            LIMIT ?
-        ''', (limit,))
-        return [(row['tag'], row['count']) for row in cursor.fetchall()]
+        cursor.execute('SELECT tags_data FROM items WHERE tags_data IS NOT NULL')
+
+        tag_counts = {}
+        for row in cursor.fetchall():
+            tags = json.loads(row['tags_data'] or '[]')
+            for tag_obj in tags:
+                tag_name = tag_obj['tag']
+                tag_counts[tag_name] = tag_counts.get(tag_name, 0) + 1
+
+        # Sort by count descending and return top N (or all if limit is None)
+        sorted_tags = sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)
+        return sorted_tags[:limit] if limit else sorted_tags
 

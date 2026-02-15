@@ -11,12 +11,15 @@ This script investigates how pr0gramm.com works:
 Run this script to gather information for implementing proper auth.
 """
 
-import requests
+import argparse
 import json
 import re
-from urllib.parse import urljoin, urlparse, parse_qs
-from pathlib import Path
 import time
+from pathlib import Path
+from typing import Optional
+from urllib.parse import urljoin
+
+import requests
 
 # Base URLs
 BASE_URL = "https://pr0gramm.com"
@@ -159,67 +162,106 @@ def investigate_content_flags():
     session.headers.update(HEADERS)
 
     print("Testing different flag values to understand the bitmask...")
+    print("NOTE: pr0gramm requires authentication for NSFW/NSFL/NSFP content!")
     print()
 
-    # Flags appear to be a bitmask:
-    # Bit 0 (1): SFW (Safe for Work)
-    # Bit 1 (2): NSFW (Not Safe for Work)
-    # Bit 2 (4): NSFL (Not Safe for Life - gore, etc.)
-    # Bit 3 (8): NSFP (Not Safe for Public - political)
-    #
-    # So: flags=15 (1111 binary) = all content
-    #     flags=1  (0001 binary) = SFW only
-    #     flags=3  (0011 binary) = SFW + NSFW
-    #     etc.
-
+    # Extended flag tests - testing up to 5 bits (31) and beyond
+    # Old system was 4-bit (max 15), new system might be 5-bit (max 31)
     flag_tests = [
-        (1, "SFW only (bit 0)"),
-        (2, "NSFW only (bit 1)"),
-        (4, "NSFL only (bit 2)"),
-        (8, "NSFP only (bit 3)"),
-        (3, "SFW + NSFW (bits 0,1)"),
-        (7, "SFW + NSFW + NSFL (bits 0,1,2)"),
-        (9, "SFW + NSFP (bits 0,3)"),
-        (15, "All content (bits 0,1,2,3)"),
+        # Individual bits
+        (1, "bit 0 (SFW?)"),
+        (2, "bit 1 (NSFW?)"),
+        (4, "bit 2 (NSFL?)"),
+        (8, "bit 3 (NSFP?)"),
+        (16, "bit 4 (NEW FLAG?)"),
+        (32, "bit 5 (NEW FLAG?)"),
+        # Common combinations
+        (3, "bits 0,1"),
+        (7, "bits 0,1,2"),
+        (15, "bits 0-3 (old 'all content')"),
+        (31, "bits 0-4 (possible new 'all content')"),
+        (63, "bits 0-5"),
+        # Other values to test
+        (9, "bits 0,3"),
+        (17, "bits 0,4"),
+        (19, "bits 0,1,4"),
+        (23, "bits 0,1,2,4"),
+        (27, "bits 0,1,3,4"),
     ]
+
+    working_flags = []
+    failing_flags = []
 
     for flags, description in flag_tests:
         url = f"{API_URL}/items/get"
         try:
             resp = session.get(url, params={"flags": flags}, timeout=10)
-            if resp.status_code == 200:
+            status = resp.status_code
+
+            if status == 200:
                 data = resp.json()
                 items = data.get("items", [])
-
-                # Analyze the flags of returned items
                 item_flags = [item.get("flags", 0) for item in items[:20]]
                 unique_flags = set(item_flags)
 
-                print(f"  flags={flags:2d} ({flags:04b}) - {description}")
-                print(f"    Items returned: {len(items)}")
-                print(f"    Item flags seen: {sorted(unique_flags)}")
-
-                # Check first item details
-                if items:
-                    first = items[0]
-                    print(f"    First item: id={first.get('id')}, flags={first.get('flags')}, image={first.get('image', '')[:30]}")
+                print(f"  ✓ flags={flags:2d} ({flags:06b}) - {description}")
+                print(f"      Status: {status}, Items: {len(items)}, Item flags seen: {sorted(unique_flags)}")
+                working_flags.append((flags, description, len(items), sorted(unique_flags)))
+            elif status == 403:
+                print(f"  ✗ flags={flags:2d} ({flags:06b}) - {description}")
+                print(f"      Status: 403 FORBIDDEN (needs auth or invalid)")
+                failing_flags.append((flags, description, "403 Forbidden"))
             else:
-                print(f"  flags={flags}: Status {resp.status_code}")
+                print(f"  ? flags={flags:2d} ({flags:06b}) - {description}")
+                print(f"      Status: {status}")
+                failing_flags.append((flags, description, f"Status {status}"))
         except Exception as e:
-            print(f"  flags={flags}: Error - {e}")
+            print(f"  ! flags={flags:2d} ({flags:06b}) - {description}")
+            print(f"      Error: {e}")
+            failing_flags.append((flags, description, str(e)))
 
-        time.sleep(0.5)  # Be nice to the server
+        time.sleep(0.3)  # Be nice to the server
 
     print()
-    print("CONCLUSION:")
-    print("  Content flags are a 4-bit bitmask:")
-    print("    Bit 0 (1): SFW  - Safe for Work")
-    print("    Bit 1 (2): NSFW - Not Safe for Work")
-    print("    Bit 2 (4): NSFL - Not Safe for Life")
-    print("    Bit 3 (8): NSFP - Not Safe for Public (political)")
-    print("  ")
-    print("  flags=15 (1111) = Show ALL content types")
-    print("  User must be logged in to access NSFW/NSFL/NSFP content")
+    print("=" * 60)
+    print("  SUMMARY")
+    print("=" * 60)
+    print()
+    print(f"  Working flags ({len(working_flags)}):")
+    for flags, desc, count, seen in working_flags:
+        print(f"    {flags:2d} ({flags:06b}): {count} items, flags seen: {seen}")
+    print()
+    print(f"  Failing flags ({len(failing_flags)}):")
+    for flags, desc, reason in failing_flags:
+        print(f"    {flags:2d} ({flags:06b}): {reason}")
+    print()
+
+    # Analyze which bits are required/optional
+    if working_flags:
+        print("  ANALYSIS:")
+        # Find which bits are common in working flags
+        all_working = [f[0] for f in working_flags]
+        all_failing = [f[0] for f in failing_flags]
+
+        for bit in range(6):
+            bit_val = 1 << bit
+            working_with_bit = [f for f in all_working if f & bit_val]
+            working_without_bit = [f for f in all_working if not (f & bit_val)]
+            failing_with_bit = [f for f in all_failing if f & bit_val]
+
+            print(f"    Bit {bit} ({bit_val:2d}): works_with={len(working_with_bit)}, works_without={len(working_without_bit)}, fails_with={len(failing_with_bit)}")
+
+    print()
+    print("  CONCLUSION:")
+    print("    - Without authentication: ONLY flags=1 (SFW) works")
+    print("    - flags >= 32 returns 400 (invalid value)")
+    print("    - Any flag that includes non-SFW content (2,4,8,16) requires authentication")
+    print("    - The flag system appears unchanged, but auth is now strictly required")
+    print()
+    print("  RECOMMENDATION:")
+    print("    - For unauthenticated: use flags=1 (SFW only)")
+    print("    - For authenticated: use flags=15 (all SFW/NSFW/NSFL/NSFP)")
+    print("    - Ensure valid PP and ME cookies are present for non-SFW content")
 
 
 def investigate_login_flow():
@@ -478,6 +520,289 @@ def generate_recommendations():
     print()
 
 
+def fetch_frontend_js_urls(session: requests.Session, max_scripts: int = 20) -> list[str]:
+    """Fetch JS bundle URLs from the main page."""
+    resp = session.get(BASE_URL, timeout=10)
+    resp.raise_for_status()
+
+    script_srcs = re.findall(r"<script[^>]+src=[\"']([^\"']+)[\"']", resp.text)
+    js_urls = []
+
+    for src in script_srcs:
+        if src.endswith(".js"):
+            js_urls.append(urljoin(BASE_URL, src))
+
+    return js_urls[:max_scripts]
+
+
+def extract_flag_mapping_from_js(js_text: str) -> dict[str, int]:
+    """Extract possible flag mappings from a JS bundle via regex heuristics."""
+    mapping: dict[str, int] = {}
+
+    patterns = [
+        r"\b(SFW|NSFW|NSFL|NSFP)\b\s*[:=]\s*(\d+)",
+        r"\b(sfw|nsfw|nsfl|nsfp)\b\s*[:=]\s*(\d+)",
+        r"\b(SFW|NSFW|NSFL|NSFP)\b\s*[:=]\s*1\s*<<\s*(\d+)",
+        r"\b(sfw|nsfw|nsfl|nsfp)\b\s*[:=]\s*1\s*<<\s*(\d+)",
+    ]
+
+    for pattern in patterns:
+        for name, value in re.findall(pattern, js_text):
+            key = name.upper()
+            number = int(value)
+            if "<<" in pattern:
+                number = 1 << number
+            mapping[key] = number
+
+    return mapping
+
+
+def investigate_frontend_flags(session: requests.Session, max_scripts: int = 20) -> Optional[dict[str, int]]:
+    """Investigate frontend JS to infer how flags are calculated."""
+    print_section("3A. FRONTEND FLAGS INVESTIGATION")
+    print("Fetching frontend JS bundles to infer flag calculation...")
+
+    try:
+        js_urls = fetch_frontend_js_urls(session, max_scripts=max_scripts)
+    except Exception as e:
+        print(f"  Failed to fetch main page JS list: {e}")
+        return None
+
+    if not js_urls:
+        print("  No JS bundles found on the main page.")
+        return None
+
+    print(f"  Found {len(js_urls)} JS bundles. Scanning...")
+
+    aggregated: dict[str, list[int]] = {}
+
+    for js_url in js_urls:
+        try:
+            resp = session.get(js_url, timeout=10)
+            if resp.status_code != 200:
+                print(f"  Skipping {js_url} (status {resp.status_code})")
+                continue
+
+            mapping = extract_flag_mapping_from_js(resp.text)
+            if mapping:
+                print(f"  Matches in: {js_url}")
+                for key, value in mapping.items():
+                    aggregated.setdefault(key, []).append(value)
+                    print(f"    {key} = {value}")
+        except Exception as e:
+            print(f"  Failed to scan {js_url}: {e}")
+
+    if not aggregated:
+        print("  No flag mappings found in JS bundles.")
+        return None
+
+    # Build a consensus mapping (most common value per key)
+    consensus: dict[str, int] = {}
+    for key, values in aggregated.items():
+        counts: dict[int, int] = {}
+        for v in values:
+            counts[v] = counts.get(v, 0) + 1
+        consensus_value = max(counts.items(), key=lambda item: item[1])[0]
+        consensus[key] = consensus_value
+
+    print("\n  Consensus mapping from frontend:")
+    for key in sorted(consensus.keys()):
+        print(f"    {key} = {consensus[key]}")
+
+    return consensus
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Investigate pr0gramm frontend and API behavior")
+    parser.add_argument(
+        "--frontend-flags",
+        action="store_true",
+        help="Scan frontend JS bundles to infer content flags",
+    )
+    parser.add_argument(
+        "--max-scripts",
+        type=int,
+        default=20,
+        help="Maximum JS bundles to scan for flag mappings (default: 20)",
+    )
+    parser.add_argument(
+        "--skip-legacy",
+        action="store_true",
+        help="Skip legacy investigations and only run requested checks",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Optional JSON output file for frontend flag mapping",
+    )
+    parser.add_argument(
+        "--test-auth",
+        action="store_true",
+        help="Test flags with authentication from .env file",
+    )
+    parser.add_argument(
+        "--pp",
+        type=str,
+        default=None,
+        help="PP cookie value for authenticated testing",
+    )
+    parser.add_argument(
+        "--me",
+        type=str,
+        default=None,
+        help="ME cookie value for authenticated testing",
+    )
+    return parser.parse_args()
+
+
+def load_env_cookies() -> tuple[Optional[str], Optional[str]]:
+    """Load PP and ME cookies from .env file or stored credentials."""
+    pp = None
+    me = None
+
+    # First try .env file
+    env_path = Path(".env")
+    if env_path.exists():
+        with open(env_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("PP=") or line.startswith("pp="):
+                    pp = line.split("=", 1)[1].strip().strip('"').strip("'")
+                elif line.startswith("ME=") or line.startswith("me="):
+                    me = line.split("=", 1)[1].strip().strip('"').strip("'")
+
+    # If not found, try stored credentials
+    if not pp or not me:
+        # Check default data dir
+        data_dir = None
+        if env_path.exists():
+            with open(env_path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("DATA_DIR"):
+                        data_dir = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        break
+
+        if data_dir:
+            creds_path = Path(data_dir) / "auth" / "credentials.json"
+            if creds_path.exists():
+                try:
+                    with open(creds_path, "r") as f:
+                        creds = json.load(f)
+                        pp = pp or creds.get("pp")
+                        me = me or creds.get("me")
+                        print(f"  Loaded credentials from: {creds_path}")
+                except Exception as e:
+                    print(f"  Failed to load credentials: {e}")
+
+    return pp, me
+
+
+def investigate_authenticated_flags(pp: Optional[str] = None, me: Optional[str] = None):
+    """Test content flags with authentication."""
+    print_section("10. AUTHENTICATED FLAGS TEST")
+
+    # Try to load from .env if not provided
+    if not pp or not me:
+        env_pp, env_me = load_env_cookies()
+        pp = pp or env_pp
+        me = me or env_me
+
+    if not pp or not me:
+        print("  No PP/ME cookies provided and none found in .env file.")
+        print("  Cannot test authenticated requests.")
+        print()
+        print("  To test, either:")
+        print("    1. Add PP and ME to .env file")
+        print("    2. Run with --pp <value> --me <value>")
+        return
+
+    print(f"  Using cookies: PP={pp[:20]}..., ME={me[:30]}...")
+    print()
+
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    session.cookies.update({
+        "pp": pp,
+        "me": me,
+    })
+
+    # Test user/sync to verify auth works
+    print("  Testing authentication...")
+    try:
+        resp = session.get(f"{API_URL}/user/sync", timeout=10)
+        print(f"    Response status: {resp.status_code}")
+        try:
+            data = resp.json()
+            print(f"    Response: {json.dumps(data, indent=2)[:500]}")
+        except:
+            print(f"    Response text: {resp.text[:500]}")
+
+        if resp.status_code == 200:
+            data = resp.json()
+            print(f"    ✓ Auth valid! Response keys: {list(data.keys())}")
+            if "loggedIn" in data:
+                print(f"    ✓ Logged in: {data.get('loggedIn')}")
+        else:
+            print(f"    ✗ Auth failed: Status {resp.status_code}")
+            # Don't return - let's try flags anyway to see what happens
+    except Exception as e:
+        print(f"    ✗ Auth test error: {e}")
+
+    print()
+    print("  Testing flags with authentication...")
+    print()
+
+    flag_tests = [
+        (1, "SFW only"),
+        (3, "SFW + NSFW"),
+        (7, "SFW + NSFW + NSFL"),
+        (9, "SFW + NSFP"),
+        (15, "All 4-bit flags (old 'all content')"),
+        (31, "All 5-bit flags"),
+    ]
+
+    for flags, description in flag_tests:
+        url = f"{API_URL}/items/get"
+        try:
+            resp = session.get(url, params={"flags": flags}, timeout=10)
+            status = resp.status_code
+
+            if status == 200:
+                data = resp.json()
+                items = data.get("items", [])
+                item_flags = [item.get("flags", 0) for item in items[:20]]
+                unique_flags = set(item_flags)
+
+                print(f"  ✓ flags={flags:2d} ({flags:06b}) - {description}")
+                print(f"      Status: {status}, Items: {len(items)}, Item flags seen: {sorted(unique_flags)}")
+            else:
+                print(f"  ✗ flags={flags:2d} ({flags:06b}) - {description}")
+                print(f"      Status: {status}")
+                try:
+                    err = resp.json()
+                    print(f"      Error: {err}")
+                except:
+                    pass
+        except Exception as e:
+            print(f"  ! flags={flags:2d} ({flags:06b}) - {description}")
+            print(f"      Error: {e}")
+
+        time.sleep(0.3)
+
+    print()
+    print("  ANALYSIS:")
+    print("    If flags=15 works with auth: The issue is missing/invalid authentication")
+    print("    If flags=15 fails with auth: pr0gramm changed their flag system")
+
+
+def write_json_output(output_path: Path, payload: dict) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+
+
 def main():
     """Run all investigations."""
     print("""
@@ -489,23 +814,42 @@ def main():
 +==============================================================+
     """)
 
+    args = parse_args()
+
+    if args.skip_legacy and not args.frontend_flags and not args.test_auth:
+        print("Nothing to do. Use --frontend-flags or --test-auth to run specific checks.")
+        return
+
     # Run investigations
     session = investigate_login_page()
-    investigate_api_endpoints(session)
-    investigate_content_flags()
-    investigate_login_flow()
-    investigate_cookie_structure()
-    investigate_new_feed()
-    investigate_oauth_or_external_auth()
-    investigate_browser_storage_paths()
-    generate_recommendations()
+
+    if not args.skip_legacy:
+        investigate_api_endpoints(session)
+        investigate_content_flags()
+        investigate_login_flow()
+        investigate_cookie_structure()
+        investigate_new_feed()
+        investigate_oauth_or_external_auth()
+        investigate_browser_storage_paths()
+        generate_recommendations()
+
+    frontend_mapping = None
+    if args.frontend_flags:
+        frontend_mapping = investigate_frontend_flags(session, max_scripts=args.max_scripts)
+        if args.output and frontend_mapping:
+            write_json_output(args.output, frontend_mapping)
+            print(f"\nSaved frontend flag mapping to: {args.output}")
+
+    if args.test_auth:
+        investigate_authenticated_flags(pp=args.pp, me=args.me)
 
     print_section("INVESTIGATION COMPLETE")
+    if frontend_mapping:
+        print("Frontend flag mapping captured. Review for flag calculation changes.")
     print("Run this script again after changes to verify behavior.")
     print("Add your own tests by modifying the investigate_* functions.")
 
 
 if __name__ == "__main__":
     main()
-
 

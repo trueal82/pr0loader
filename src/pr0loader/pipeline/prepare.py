@@ -3,6 +3,7 @@
 import csv
 import logging
 import re
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -25,6 +26,15 @@ logger = logging.getLogger(__name__)
 VALID_TAG_REGEX = re.compile(r'^[a-zA-Z0-9]+$')
 NSFW_TAGS = {'nsfw', 'nsfl', 'nsfp'}
 
+# Trash tags that should be blacklisted regardless of frequency
+# These are measured from actual data - common but not informative
+TRASH_TAGS_BLACKLIST = {
+    'repost', 'nice', 'oc', 'gay', 'alt', 'fake', 'old', 'video',
+    'webm', 'gif', 'jpg', 'png', 'sound', 'teil',  # Format indicators
+    'arsch', 'titten',  # Generic body parts
+    # Add more as discovered from data analysis
+}
+
 
 class PreparePipeline:
     """Pipeline stage for preparing training dataset."""
@@ -32,10 +42,75 @@ class PreparePipeline:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.stats = PipelineStats()
+        self.tag_counts: Optional[dict[str, int]] = None
+        self.trash_tags: set[str] = set()
+        self.high_confidence_threshold = 0.4  # Tags with >0.4 confidence are likely user-verified
+
+    def analyze_tag_quality(self, storage: SQLiteStorage) -> tuple[dict[str, int], set[str]]:
+        """
+        Analyze tags to identify trash tags and build vocabulary.
+
+        Strategy:
+        1. Find VERY common tags (top 0.5%) - likely trash like "repost", "nice"
+        2. Combine with manual blacklist
+        3. Build full tag counts for reference
+
+        Returns:
+            Tuple of (all_tag_counts, trash_tags_to_filter)
+        """
+        print_info("Analyzing tag quality...")
+
+        # Get all tag counts from database
+        all_tag_counts = storage.get_tag_counts(limit=None)
+        total_tags = len(all_tag_counts)
+
+        print_info(f"Total unique tags: {total_tags}")
+
+        # Find extremely common tags (top 0.5%) - likely trash
+        top_n = max(int(total_tags * 0.005), 20)  # At least top 20
+        top_tags = all_tag_counts[:top_n]
+
+        # Start with manual blacklist
+        trash_tags = TRASH_TAGS_BLACKLIST.copy()
+
+        # Add extremely common tags to potential trash list
+        # (Manual review would refine this, but these are usually meta-tags)
+        for tag, count in top_tags:
+            tag_lower = tag.lower()
+            if tag_lower not in NSFW_TAGS:  # Don't add NSFW flags
+                # Very common tags are often trash (repost, nice, etc.)
+                trash_tags.add(tag)
+
+        print_info(f"Identified {len(trash_tags)} potential trash tags")
+        print_info("Top 20 most common tags (potential trash):")
+        for tag, count in top_tags[:20]:
+            marker = "🗑️" if tag in trash_tags else "✓"
+            print_info(f"  {marker} {tag}: {count:,} occurrences")
+
+        # Show tag count distribution
+        if logger.isEnabledFor(logging.DEBUG):
+            tag_counts_list = [count for _, count in all_tag_counts]
+            logger.debug(f"Tag count distribution:")
+            logger.debug(f"  Max: {max(tag_counts_list):,}")
+            logger.debug(f"  Top 100 avg: {sum(tag_counts_list[:100]) / 100:.1f}")
+            logger.debug(f"  Median: {tag_counts_list[len(tag_counts_list)//2]}")
+            logger.debug(f"  Tags with 1 occurrence: {sum(1 for c in tag_counts_list if c == 1)}")
+
+        return dict(all_tag_counts), trash_tags
 
     def process_tags(self, item: Item) -> dict:
         """
-        Process tags for an item.
+        Process tags for an item with smart filtering.
+
+        Filtering strategy (your insight!):
+        1. Remove NSFW flags (extracted separately)
+        2. Validate format (alphanumeric)
+        3. Blacklist trash tags (repost, nice, etc.) - ALWAYS filtered
+        4. Keep rare tags IF they have high confidence (>0.4) - user-verified specific tags
+        5. Sort by confidence
+
+        This allows specific rare tags (e.g., "quantenphysik" with high confidence)
+        while filtering common trash (e.g., "repost" even with high confidence).
 
         Returns dict with NSFW flags and valid tags.
         """
@@ -57,10 +132,31 @@ class PreparePipeline:
                 continue
 
             # Validate tag name (alphanumeric only)
-            if VALID_TAG_REGEX.match(tag.tag):
-                valid_tags.append(tag)
+            if not VALID_TAG_REGEX.match(tag.tag):
+                continue
 
-        # Sort by confidence
+            # ALWAYS filter trash tags (regardless of confidence or frequency)
+            if tag.tag in self.trash_tags or tag.tag.lower() in self.trash_tags:
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"Filtered trash tag: {tag.tag} (confidence: {tag.confidence:.3f})")
+                continue
+
+            # Keep tags with HIGH confidence (>0.4) - likely user-verified
+            # These are valuable even if rare (specific technical terms, etc.)
+            if tag.confidence >= self.high_confidence_threshold:
+                valid_tags.append(tag)
+                continue
+
+            # For low-confidence tags, require them to be in vocabulary (popular enough)
+            # This filters out rare misspellings, noise, etc.
+            if self.tag_counts and tag.tag not in self.tag_counts:
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"Filtered rare low-confidence tag: {tag.tag} (confidence: {tag.confidence:.3f})")
+                continue
+
+            valid_tags.append(tag)
+
+        # Sort by confidence (highest first)
         valid_tags.sort(key=lambda t: t.confidence, reverse=True)
 
         return {
@@ -121,6 +217,13 @@ class PreparePipeline:
             fieldnames.extend([f'tag{i}', f'confidence{i}'])
 
         with SQLiteStorage(self.settings.db_path) as storage:
+            # STEP 1: Analyze tag quality
+            # - Identify trash tags (very common meta-tags like "repost")
+            # - Build full tag count reference
+            self.tag_counts, self.trash_tags = self.analyze_tag_quality(storage)
+
+            print_info(f"Strategy: Blacklist {len(self.trash_tags)} trash tags, keep rare tags with high confidence (>{self.high_confidence_threshold})")
+
             total_items = storage.get_item_count()
             print_info(f"Processing {total_items:,} items")
 
@@ -175,6 +278,8 @@ class PreparePipeline:
             print_stats_table("Prepare Results", {
                 "Items processed": self.stats.items_processed,
                 "Items skipped": self.stats.items_skipped,
+                "Trash tags filtered": len(self.trash_tags),
+                "High confidence threshold": self.high_confidence_threshold,
                 "Output file": str(output_file),
             })
 
