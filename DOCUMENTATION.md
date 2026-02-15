@@ -1,511 +1,352 @@
-# pr0loader Developer Documentation
+# pr0loader — Developer & Architecture Documentation
 
-**For developers, maintainers, and AI assistants (Claude, etc.)**
+Audience: **software architects**, **Python developers**, **data scientists/ML engineers**, and **LLM assistants**.
 
-This document explains not just HOW the code works, but WHY certain decisions were made.
-It captures the evolution of design decisions, performance learnings, and architectural patterns.
+This document is both:
+- a **human-readable architecture guide** (why + tradeoffs)
+- a **machine-usable spec** (contracts + invariants + “do-not-break” rules)
 
----
-
-## Table of Contents
-
-1. [Architecture Overview](#architecture-overview)
-2. [Pipeline Stages](#pipeline-stages)
-3. [Performance Optimizations](#performance-optimizations)
-4. [Data-Driven Design Philosophy](#data-driven-design-philosophy)
-5. [SQLite Considerations](#sqlite-considerations)
-6. [Image Preprocessing](#image-preprocessing)
-7. [Tag Processing Logic](#tag-processing-logic)
-8. [Common Pitfalls](#common-pitfalls)
-9. [For AI Assistants](#for-ai-assistants)
+> Design intent: **Prepare once, train many times** — with **data-driven** thresholds so behavior adapts as the dataset grows.
 
 ---
 
-## Architecture Overview
+## Contents
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              pr0loader Pipeline                             │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   ┌─────────┐     ┌──────────┐     ┌─────────┐     ┌─────────┐             │
-│   │  FETCH  │ ──► │ DOWNLOAD │ ──► │ PREPARE │ ──► │  TRAIN  │             │
-│   └─────────┘     └──────────┘     └─────────┘     └─────────┘             │
-│        │               │                │               │                   │
-│        ▼               ▼                ▼               ▼                   │
-│   ┌─────────┐     ┌──────────┐     ┌─────────┐     ┌─────────┐             │
-│   │ SQLite  │     │  Media   │     │ Parquet │     │  Model  │             │
-│   │   DB    │     │  Files   │     │  File   │     │ .keras  │             │
-│   └─────────┘     └──────────┘     └─────────┘     └─────────┘             │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-                           SYNC = FETCH + DOWNLOAD
-```
-
-### Key Files
-
-| File | Purpose |
-|------|---------|
-| `cli.py` | Typer-based CLI with interactive menu |
-| `config.py` | Pydantic settings, loads from `.env` |
-| `pipeline/fetch.py` | API metadata fetching |
-| `pipeline/download.py` | Media file downloading |
-| `pipeline/prepare.py` | Dataset preparation (pandas + multiprocessing) |
-| `pipeline/train.py` | TensorFlow/Keras model training |
-| `storage/sqlite.py` | SQLite storage with WAL mode |
+1. [Executive summary](#0-executive-summary-tldr)
+2. [System architecture](#1-system-architecture)
+3. [Repository map](#2-repository-map-where-to-look)
+4. [Pipeline stages](#3-pipeline-stages-what--why)
+5. [Performance model](#4-performance-model-what-makes-it-fast)
+6. [Tag logic](#5-tag-logic-data-driven-no-static-lists)
+7. [Image preprocessing](#6-image-preprocessing-done-in-prepare-never-in-train)
+8. [Operational guidance](#7-operational-guidance)
+9. [Troubleshooting](#8-common-pitfalls--troubleshooting)
+10. [LLM / future maintainer notes](#9-llm--future-maintainer-notes)
+11. [Design glossary](#appendix-b-design-glossary)
 
 ---
 
-## Pipeline Stages
+## 0) Executive summary (TL;DR)
 
-### Stage 1: FETCH
+### What you get
 
-**Purpose:** Download metadata (items, tags) from pr0gramm API
+- `fetch` → **SQLite** metadata (high volume writes)
+- `download` → **media/** files (high volume IO)
+- `prepare` → **Parquet + .meta.json** (expensive analytics + preprocessing, done once)
+- `train` → **model** (repeated often; should be cheap relative to prepare)
 
-**Key Decisions:**
+### Three rules that keep this fast
 
-1. **Parallel Requests with Semaphore**
-   - Uses `asyncio` + `aiohttp` for concurrent API calls
-   - Semaphore limits concurrent requests (default: 5)
-   - WHY: pr0gramm rate-limits aggressive clients
-
-2. **Fibonacci Backoff**
-   - On 503/rate-limit: wait Fibonacci sequence (1, 1, 2, 3, 5, 8...)
-   - WHY: More gradual than exponential, gentler on the server
-
-3. **Flags Calculation**
-   - User sets content preferences (SFW, NSFW, NSFL, NSFP)
-   - Flags calculated as: `sum(1 << bit for enabled)`
-   - IMPORTANT: flags=15 may cause 403 if account doesn't have all flags unlocked
-
-4. **Range Detection**
-   - Detects gaps in the database
-   - Fetches missing ranges first, then newest
-   - WHY: Ensures complete dataset even after interruptions
-
-```
-Flags Bits:
-┌─────┬──────┬──────┬──────┐
-│ SFW │ NSFW │ NSFL │ NSFP │
-│  1  │  2   │  4   │  8   │
-└─────┴──────┴──────┴──────┘
-
-Example: SFW + NSFW = 1 + 2 = 3
-```
-
-### Stage 2: DOWNLOAD
-
-**Purpose:** Download actual media files (images/videos)
-
-**Key Decisions:**
-
-1. **HEAD Request Verification**
-   - Before downloading, sends HEAD request
-   - Compares Content-Length with local file size
-   - WHY: Avoids re-downloading existing files
-
-2. **Images Only by Default**
-   - Videos are large and slow to process
-   - Use `--include-videos` to download videos too
-
-3. **Connection Pool**
-   - Reuses HTTP connections
-   - Pool size matches concurrency level
-   - WARNING: "Connection pool full" message indicates pool size mismatch
-
-### Stage 3: PREPARE
-
-**Purpose:** Create training-ready Parquet file with embedded images
-
-**This is the most complex stage. See detailed sections below.**
-
-**Key Outputs:**
-- `{timestamp}_dataset.parquet` - Training data with embedded images
-- `{timestamp}_dataset.meta.json` - Metadata with computed thresholds
-
-### Stage 4: TRAIN
-
-**Purpose:** Train ResNet50-based multi-label classifier
-
-**Key Decisions:**
-
-1. **No Image Preprocessing in Train**
-   - Images come pre-processed from PREPARE
-   - Already: resized, RGB→BGR, ImageNet mean subtracted
-   - WHY: Prepare once, train many times
-
-2. **Frozen Base Model**
-   - ResNet50 weights frozen initially
-   - Only classification head is trained
-   - WHY: Faster training, prevents overfitting on small datasets
-
-3. **Multi-label Classification**
-   - Uses sigmoid activation (not softmax)
-   - Binary cross-entropy loss
-   - Each image can have multiple tags
+1. **No SQLite JSON functions** (`json_array_length`, `json_extract`, …)
+   - Parse JSON in pandas/numpy.
+2. **No Python threads for CPU-heavy work**
+   - Use `multiprocessing` to bypass the GIL.
+3. **No static tag assumptions**
+   - Thresholds and “trash tags” are learned from current data distributions.
 
 ---
 
-## Performance Optimizations
+## 1) System architecture
 
-### The GIL Problem
-
-**Problem:** Python's Global Interpreter Lock (GIL) prevents true parallelism
+### 1.1 Pipeline overview
 
 ```
-WRONG (GIL blocks parallelism):
-┌──────────────────────────────────────┐
-│     ThreadPoolExecutor               │
-│  ┌──────┐ ┌──────┐ ┌──────┐         │
-│  │ T1   │ │ T2   │ │ T3   │  ◄─ GIL │
-│  │ wait │ │ work │ │ wait │         │
-│  └──────┘ └──────┘ └──────┘         │
-└──────────────────────────────────────┘
+                 (network)             (disk)                 (RAM+CPU)              (GPU/CPU)
 
-RIGHT (bypass GIL):
-┌──────────────────────────────────────┐
-│     multiprocessing.Pool             │
-│  ┌──────┐ ┌──────┐ ┌──────┐         │
-│  │ P1   │ │ P2   │ │ P3   │  ◄─ Separate interpreters │
-│  │ work │ │ work │ │ work │         │
-│  └──────┘ └──────┘ └──────┘         │
-└──────────────────────────────────────┘
+   ┌─────────┐      ┌─────────┐        ┌──────────┐           ┌─────────┐            ┌─────────┐
+   │ pr0 API  │ ◄──► │  FETCH  │ ─────► │  SQLite  │ ────────► │ PREPARE │ ─────────► │  TRAIN  │
+   └─────────┘      └─────────┘        └──────────┘           └─────────┘            └─────────┘
+                         │                   ▲                     │
+                         │                   │                     │
+                         ▼                   │                     ▼
+                    ┌─────────┐              │                ┌──────────┐
+                    │ DOWNLOAD│ ─────────────┘                │ Parquet   │
+                    └─────────┘                               │ + .meta   │
+                         │                                    └──────────┘
+                         ▼
+                    ┌─────────┐
+                    │ media/  │
+                    └─────────┘
+
+   sync = fetch + download
 ```
 
-**Solution in prepare.py:**
-- Use `multiprocessing.Pool` instead of `ThreadPoolExecutor`
-- Module-level function `_preprocess_image_for_resnet()` (can't be a method)
-- Each worker is a separate Python process
+### 1.2 Key invariants (contracts)
 
-### SQLite Optimizations
+These are **non-negotiable**. Stages rely on them.
 
-**Problem:** Default SQLite is optimized for safety, not speed
+#### Prepare output contract (`*.parquet` + `*.meta.json`)
 
-**Applied PRAGMA Settings:**
+**Required columns**:
+- `id: int`
+- `image: str` (relative path, kept for traceability/debug)
+- `tags: list[str]` (length >= `min_tags`)
+- `confidences: list[float]` (same length and order as `tags`)
+- `is_nsfw/is_nsfl/is_nsfp: bool`
+- `image_data: bytes` (raw float32 bytes)
 
-```sql
-PRAGMA journal_mode=WAL;      -- Write-Ahead Logging (3-5x faster writes)
-PRAGMA synchronous=NORMAL;    -- Balanced safety/speed
-PRAGMA cache_size=-524288;    -- 512MB cache (default is ~2MB)
-PRAGMA mmap_size=1073741824;  -- 1GB memory-mapped I/O
-PRAGMA temp_store=MEMORY;     -- Temp tables in RAM
-```
+**Image decoding contract**:
+- `arr = np.frombuffer(image_data, np.float32).reshape(H, W, 3)`
+- channel order is **BGR**
+- already **ResNet50-preprocessed** (ImageNet mean subtracted)
 
-**WAL Mode Explained:**
+#### Train contract
 
-```
-Without WAL (DELETE mode):
-┌────────┐  write  ┌────────┐  commit  ┌────────┐
-│ Memory │ ──────► │ Journal│ ───────► │  DB    │
-└────────┘         └────────┘          └────────┘
-                   (creates file)      (blocks reads)
-
-With WAL:
-┌────────┐  write  ┌────────┐  checkpoint  ┌────────┐
-│ Memory │ ──────► │  WAL   │ ──────────► │  DB    │
-└────────┘         └────────┘             └────────┘
-                   (append-only)     (readers not blocked)
-```
-
-**Concurrent Access Warning:**
-- Running PREPARE while FETCH is active = slow reads
-- WAL helps but doesn't eliminate lock contention
-- Added detection in prepare.py: `_check_concurrent_access()`
-
-### Pandas Over SQLite
-
-**Problem:** SQLite JSON functions are extremely slow
-
-```python
-# SLOW (SQLite processes JSON):
-SELECT * FROM items WHERE json_array_length(tags_data) >= 5
-
-# FAST (Pandas processes JSON):
-df = pd.read_sql('SELECT * FROM items', conn)
-df['tags'] = df['tags_data'].apply(json.loads)
-df = df[df['tags'].apply(len) >= 5]
-```
-
-**Result:** 10-20x faster filtering with 64GB RAM available
+- Uses `image_data` directly.
+- Must not decode/resize/normalize (no `tf.io.read_file`, no `decode_jpeg`, no `preprocess_input`).
+- If `image_data` is missing, training **fails fast** with a clear message.
 
 ---
 
-## Data-Driven Design Philosophy
-
-### NO HARDCODED THRESHOLDS
-
-**Old approach (bad):**
-```python
-# Hardcoded trash tag patterns
-TRASH_PATTERNS = [r'^repost$', r'^gif$', r'^video$', ...]
-HIGH_CONFIDENCE_THRESHOLD = 0.3
-MIN_TAG_FREQUENCY = 5
-```
-
-**New approach (good):**
-```python
-# All thresholds computed from actual data
-high_conf_threshold = df['confidence'].quantile(0.75)
-min_corpus_freq = max(3, int(df['frequency'].quantile(0.25)))
-trash_tags = identify_from_statistics(tag_stats)
-```
-
-### Trash Tag Detection Criteria
-
-All criteria are data-driven:
-
-| Criterion | Calculation | Rationale |
-|-----------|-------------|-----------|
-| High doc frequency | > 95th percentile | Meta-tags appear everywhere |
-| Low IDF + low conf | IDF < 10th pctl AND conf < median | Common but untrusted |
-| High conf variance | std > 2× mean std | Users disagree |
-| Singleton + low conf | doc_freq=1 AND conf < median | One-off noise |
-
-### Confidence Merging
-
-**Problem:** Same tag may appear multiple times with different capitalizations
-
-```
-"Feet" -> confidence 0.3
-"feet" -> confidence 0.4
-"FEET" -> confidence 0.2
-```
-
-**Solution:** Normalize to lowercase, SUM confidences (not max)
-
-```python
-# WHY SUM, not MAX:
-# - Each tag occurrence represents a user vote
-# - If both "Feet" and "feet" exist, that's 2 people who think it's relevant
-# - Combined confidence should be higher than either individual
-normalized[tag_lower] = normalized.get(tag_lower, 0) + conf
-```
-
----
-
-## Image Preprocessing
-
-### ResNet50 Requirements
-
-ResNet50 expects images preprocessed as:
-
-1. Size: 224×224 pixels
-2. Color order: BGR (not RGB!)
-3. Zero-centered by ImageNet mean: `[103.939, 116.779, 123.68]`
-
-```python
-# Complete preprocessing in prepare.py:
-arr = np.array(img, dtype=np.float32)  # RGB, 0-255
-arr = arr[..., ::-1]                    # RGB → BGR
-arr -= IMAGENET_MEAN                    # Zero-center
-# Result: float32, shape (224, 224, 3), values roughly [-128, +128]
-```
-
-### Why Embed in Parquet?
-
-**Problem:** Training reads images repeatedly
-
-```
-Without embedding (6M images × 5 epochs):
-┌─────────┐     ┌──────────────┐
-│ Train   │ ──► │ Filesystem   │  × 30 MILLION file reads!
-│ Epoch 1 │     │ (HDD/RAID5)  │
-│ ...     │     │              │
-│ Epoch 5 │     │              │
-└─────────┘     └──────────────┘
-
-With embedding:
-┌─────────┐     ┌──────────────┐     ┌─────────┐
-│ Prepare │ ──► │ Parquet      │ ──► │ Train   │
-│ (once)  │     │ (sequential) │     │ (RAM)   │
-└─────────┘     └──────────────┘     └─────────┘
-                 6M × 1 read          All in memory
-```
-
-**Storage Format:**
-
-```python
-# Each image stored as raw bytes (tobytes())
-image_data = arr.tobytes()  # 224 × 224 × 3 × 4 = 602,112 bytes per image
-
-# Reconstructed in train:
-arr = np.frombuffer(image_data, dtype=np.float32).reshape(224, 224, 3)
-```
-
----
-
-## Tag Processing Logic
-
-### Content Flags vs Tags
-
-**Content flags** are metadata about content rating:
-- `sfw`, `nsfw`, `nsfl`, `nsfp`
-- These are NOT descriptive tags
-- Extracted into separate boolean columns
-
-```python
-CONTENT_FLAGS = frozenset({'nsfw', 'nsfl', 'nsfp', 'sfw'})
-
-# In processing:
-if tag_lower == 'nsfw':
-    is_nsfw = True  # Store as metadata
-elif tag_lower not in CONTENT_FLAGS:
-    normalized[tag_lower] = ...  # Process as content tag
-```
-
-### Minimum Tags Requirement
-
-**WHY 5 tags minimum?**
-- Multi-label classifier needs multiple labels per sample
-- Single-tag images don't help model learn correlations
-- 5 is a balance: keeps most data, ensures meaningful labels
-
-**Trash Tag Rescue:**
-
-```python
-# If good tags < min_tags, add back trash tags with highest confidence
-if len(valid_tags) < min_tags:
-    needed = min_tags - len(valid_tags)
-    valid_tags.extend(trash_tags_sorted[:needed])
-```
-
----
-
-## Common Pitfalls
-
-### 1. Flags 403 Error
-
-**Symptom:** `Fetch failed: disk I/O error` or 403 responses
-
-**Cause:** Requesting content flags user doesn't have access to
-
-**Fix:** Check account settings on pr0gramm.com, or use lower flags value
-
-### 2. Connection Pool Full Warning
-
-**Symptom:** `Connection pool is full, discarding connection`
-
-**Cause:** Pool size doesn't match concurrency level
-
-**Fix:** Match pool size to number of concurrent workers
-
-### 3. Slow SQLite Reads
-
-**Symptom:** PREPARE takes forever on first step
-
-**Cause:** FETCH running concurrently OR slow storage
-
-**Fix:**
-- Wait for FETCH to complete: `pr0loader prepare --wait`
-- Or use SSD instead of HDD
-
-### 4. Out of Memory in PREPARE
-
-**Symptom:** Process killed during image embedding
-
-**Cause:** Too many images × 600KB each
-
-**Fix:** Use dev mode for testing: `settings.dev_mode = True`
-
-### 5. TensorFlow Not Using GPU
-
-**Symptom:** Training very slow, GPU at 0%
-
-**Cause:** CUDA/cuDNN not installed or version mismatch
-
-**Fix:** Check `pr0loader info` output, verify CUDA installation
-
----
-
-## For AI Assistants
-
-### Key Context for Future Claude Instances
-
-When working on this codebase, remember:
-
-1. **Performance is Critical**
-   - Target: 6 million images
-   - Every loop matters
-   - Prefer numpy/pandas over Python loops
-   - Use multiprocessing for CPU-bound tasks (not threading!)
-
-2. **Data-Driven, Not Hardcoded**
-   - NO magic numbers in tag filtering
-   - All thresholds from percentiles/statistics
-   - Dataset may change, code must adapt
-
-3. **Separation of Concerns**
-   - PREPARE does ALL image preprocessing
-   - TRAIN does NO image manipulation
-   - This is intentional for "prepare once, train many"
-
-4. **SQLite Quirks**
-   - WAL mode is enabled but concurrent writes still slow reads
-   - Don't use `json_array_length()` or similar - do it in pandas
-   - Large cache (512MB) is set - uses RAM
-
-5. **Testing Philosophy**
-   - `--dev` mode limits data for fast iteration
-   - Always test with small dataset first
-   - Full runs take hours - don't do them casually
-
-### File Locations Quick Reference
+## 2) Repository map (where to look)
 
 ```
 src/pr0loader/
-├── cli.py           # ALL CLI commands defined here
-├── config.py        # Settings class, .env loading
-├── models.py        # Pydantic models for API data
-├── pipeline/
-│   ├── fetch.py     # API fetching (async)
-│   ├── download.py  # Media downloading
-│   ├── prepare.py   # Dataset prep (pandas + multiprocessing)
-│   ├── train.py     # Model training (TensorFlow)
-│   └── sync.py      # Combines fetch + download
+├── cli.py                 # CLI commands
+├── config.py              # Settings (.env / defaults)
+├── models.py              # Typed models / stats
 ├── storage/
-│   └── sqlite.py    # Database operations, WAL mode
-└── utils/
-    ├── console.py   # Rich console helpers
-    └── backoff.py   # Fibonacci backoff
+│   └── sqlite.py          # SQLite connect + PRAGMAs
+└── pipeline/
+    ├── fetch.py            # Metadata ingest
+    ├── download.py         # Media download
+    ├── prepare.py          # Analytics + dataset build (pandas + multiprocessing)
+    ├── train.py            # Training (expects embedded images)
+    └── sync.py             # Orchestrates fetch+download
 ```
-
-### Common Modifications
-
-**Adding a new CLI option:**
-1. Add parameter to function in `cli.py`
-2. Add to Settings class in `config.py` if persistent
-3. Update help text
-
-**Changing tag filtering:**
-1. Edit `_analyze_tags_datadriven()` in `prepare.py`
-2. Thresholds should be computed, not hardcoded
-3. Document reasoning in `trash_tag_reasons`
-
-**Changing image preprocessing:**
-1. Edit `_preprocess_image_for_resnet()` in `prepare.py`
-2. Update metadata in `_save_metadata()`
-3. Verify train.py reads correctly
 
 ---
 
-## Metadata File Format
+## 3) Pipeline stages (what + why)
 
-Every Parquet file has a `.meta.json` companion:
+This section uses a consistent template:
+- **Purpose** (what it does)
+- **Why** (reason it exists)
+- **Outputs**
+- **Performance notes**
+
+### 3.1 `fetch` — metadata ingest
+
+**Purpose:** Pull item metadata from the pr0 API and store it in SQLite.
+
+**Why:**
+- Decouples network ingestion from dataset building.
+- Makes ingestion resumable (gap filling, incremental updates).
+
+**Outputs:** SQLite rows in `items` (and related tables).
+
+**Performance notes:**
+- Parallel HTTP helps, but SQLite writes often dominate.
+- Some content flag combinations can yield **403** depending on account permissions.
+
+Flags (conceptual):
+
+```
+Bits:  1      2      4      8
+     SFW   NSFW   NSFL   NSFP
+
+flags = sum(enabled_bits)
+```
+
+### 3.2 `download` — media ingest
+
+**Purpose:** Download images/videos into `media/`.
+
+**Why:**
+- Keeps `prepare` / `train` offline and repeatable.
+
+**Outputs:** filesystem objects (images/videos).
+
+**Performance notes:**
+- Uses verification to avoid redownload.
+- Connection pool warnings usually mean concurrency > pool size.
+
+### 3.3 `prepare` — dataset creation (the heavy lifter)
+
+**Purpose:** Build a **training-ready** Parquet with embedded, preprocessed images.
+
+**Why:**
+- Expensive work happens once.
+- Training becomes repeatable and fast.
+
+**Outputs:**
+- `output/*.parquet`
+- `output/*.meta.json`
+
+**Performance notes:**
+- Avoid SQLite JSON functions; use pandas.
+- Use multiprocessing for CPU-bound image preprocessing.
+
+**Core steps:**
+1. Read minimal columns from SQLite.
+2. Parse tags JSON in Python.
+3. Compute data-driven tag thresholds + trash tags.
+4. Build per-item tag lists with `min_tags` invariant.
+5. Preprocess images (resize + ResNet50 transform) and embed.
+
+### 3.4 `train` — model training
+
+**Purpose:** Train the ML model from prepared Parquet.
+
+**Why:**
+- Training is expected to run many times (hyperparams, experiments).
+- If train does decoding/resizing/normalization, it becomes IO-bound and wastes CPU.
+
+**Outputs:**
+- `models/*.keras` (and optional mappings)
+
+---
+
+## 4) Performance model (what makes it fast)
+
+### 4.1 SQLite: WAL + pragmatic IO settings
+
+SQLite is used because it’s simple and portable.
+
+We rely on:
+- WAL to reduce writer/reader contention
+- bigger cache/mmap for fewer HDD seeks
+
+**Caveat:** Concurrent `fetch` (writes) + `prepare` (reads) is still slower.
+
+### 4.2 Don’t fight the GIL
+
+- Threads don’t help CPU-heavy Python loops.
+- `multiprocessing` gives real parallelism.
+
+Rule of thumb:
+- **IO-bound** → threads can be OK
+- **CPU-bound** → processes
+
+### 4.3 Pandas over SQLite JSON
+
+We moved *all* JSON analysis into pandas/numpy because:
+- SQLite JSON functions scale poorly in practice (especially on HDD)
+- pandas can utilize vectorized C/NumPy operations
+
+---
+
+## 5) Tag logic (data-driven, no static lists)
+
+### 5.1 Principles
+
+1. **Normalize tags to lowercase**
+2. **Merge confidence by SUM** (votes accumulate)
+3. **Trash detection is statistical**
+4. **Keep samples label-rich** (`min_tags`) to support multi-label learning
+
+### 5.2 “Trash tags” are learned
+
+Trash is not a hardcoded list.
+We derive it from the dataset using metrics like:
+- document frequency
+- IDF
+- confidence distribution
+- confidence variance
+
+Output artifacts:
+- `trash_tags` set
+- `trash_tag_reasons` mapping (debuggable)
+
+### 5.3 `min_tags` invariant
+
+If strict filtering would drop below `min_tags`, we re-add the highest-confidence trash tags.
+This is a deliberate compromise:
+- preserves tag-learnability
+- avoids throwing away too much data
+
+---
+
+## 6) Image preprocessing (done in `prepare`, never in `train`)
+
+### 6.1 Target (ResNet50-ready) format
+
+Transform:
+1. decode image → RGB
+2. resize → `image_size` (typically 224×224)
+3. `float32`
+4. RGB → BGR
+5. subtract ImageNet mean `[103.939, 116.779, 123.68]`
+
+Result: `float32` array shaped `(H, W, 3)`.
+
+### 6.2 Storage: bytes in Parquet
+
+We store raw bytes:
+
+```
+image_data = arr.tobytes()
+
+# reconstruct
+arr = np.frombuffer(image_data, np.float32).reshape(H, W, 3)
+```
+
+Why bytes:
+- Arrow/Parquet handle bytes reliably
+- avoids nested ndarray conversion issues
+
+### 6.3 Scale note
+
+Raw float32 images are large at millions of items.
+Future enhancements may include:
+- sharded Parquet datasets
+- streaming training
+- caching embeddings instead of pixels
+
+---
+
+## 7) Operational guidance
+
+### 7.1 Recommended run order
+
+1) `sync`
+2) `prepare`
+3) iterate on `train`
+
+### 7.2 Avoid fetch+prepare overlap
+
+- use `pr0loader prepare --wait`
+- or schedule prepare separately
+
+---
+
+## 8) Common pitfalls & troubleshooting
+
+- **403 on fetch**: flags/account permissions.
+- **prepare load is slow**: fetch running or slow HDD seek.
+- **CPU not utilized**: likely IO-bound or accidentally threaded CPU work.
+- **train slow**: dataset missing `image_data` or train is preprocessing (should not).
+
+---
+
+## 9) LLM / future-maintainer notes
+
+### 9.1 Do-not-break list
+
+- `prepare` always embeds images and writes `.meta.json`.
+- `train` never preprocesses images.
+- tag thresholds remain data-driven.
+
+### 9.2 Change checklist
+
+Before merging changes, ask:
+1. Did I introduce static heuristics?
+2. Did I reintroduce SQLite JSON evaluation?
+3. Did I add CPU-heavy threading?
+4. Did I change the Parquet contract without updating train + metadata?
+
+---
+
+## Appendix A) Dataset metadata (`*.meta.json`)
+
+`.meta.json` exists so humans and tools can answer:
+- which preprocessing is used
+- which thresholds were computed
+
+Example:
 
 ```json
 {
-  "created": "2026-02-16T00:00:00",
-  "total_items": 500000,
-  "items_skipped": 50000,
-  "min_tags": 5,
-  "unique_tags": 100000,
-  
-  "thresholds": {
-    "high_confidence": 0.342,
-    "min_corpus_frequency": 3
-  },
-  
   "images_embedded": true,
   "image_size": [224, 224],
   "image_format": {
@@ -515,23 +356,49 @@ Every Parquet file has a `.meta.json` companion:
     "color_order": "BGR",
     "imagenet_mean": [103.939, 116.779, 123.68]
   },
-  
-  "trash_tags_sample": {
-    "repost": "high_doc_freq (>5.0%)",
-    "gif": "high_doc_freq (>5.0%)"
+  "thresholds": {
+    "high_confidence": 0.342,
+    "min_corpus_frequency": 3
   }
 }
 ```
 
 ---
 
-## Version History
+## Appendix B) Design glossary
 
-- **v2.0.0** - Complete rewrite with pandas, multiprocessing, embedded images
-- **v1.x** - Original implementation with row-by-row processing
+A glossary for architects/data scientists (and for LLM context).
+
+### Dataset / tagging terms
+
+- **Tag**: a (usually human-added) label for an item.
+- **Confidence**: numeric score/vote strength from user interactions (+/-). In pr0loader we treat it as *vote mass*.
+- **Lowercasing / normalization**: canonicalize tag names to reduce duplicates (`Feet` → `feet`).
+- **Frequency**: how often a tag occurs across all tag assignments (total occurrences).
+- **Document frequency (DF)**: number of distinct items containing the tag.
+- **DF ratio**: `DF / total_items` (share of dataset containing that tag).
+- **IDF (inverse document frequency)**: `log(total_items / DF)`. Higher = rarer = more “informative”.
+- **Multi-label**: one image can have multiple tags (not mutually exclusive).
+- **Multi-hot vector**: label encoding where each class has a 0/1 bit.
+
+### Model / ML terms
+
+- **ResNet50 preprocessing**: specific transform expected by the ImageNet-pretrained ResNet50:
+  - RGB → BGR
+  - subtract ImageNet mean `[103.939, 116.779, 123.68]`
+- **Frozen base model**: use pretrained CNN weights as fixed feature extractor; train only the classifier head.
+- **Sigmoid head**: independent probability per tag (required for multi-label).
+- **Binary cross entropy**: typical loss for multi-label classification.
+
+### Systems / performance terms
+
+- **GIL (Global Interpreter Lock)**: prevents true parallel CPU execution in one Python process.
+- **Threading vs multiprocessing**: threads share one interpreter (GIL); processes run truly parallel.
+- **WAL (Write-Ahead Logging)**: SQLite journaling mode enabling better concurrent read/write behavior.
+- **IO-bound vs CPU-bound**:
+  - IO-bound: waiting on disk/network → threads can help.
+  - CPU-bound: heavy compute → processes (or vectorized/native code).
 
 ---
 
-*Last updated: February 2026*
-*Maintained by: Human + Claude collaboration*
-
+*Last updated: 2026-02*
