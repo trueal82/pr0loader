@@ -1,3 +1,13 @@
-pymongo==4.5.0
-python-dotenv==1.0.0
-requests==2.31.0
+# Core dependencies
+typer[all]>=0.9.0
+rich>=13.0.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+pandas>=2.0.0
+numpy>=1.24.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+
+# Optional ML dependencies (uncomment if needed)
+# tensorflow>=2.15.0
+# pillow>=10.0.0
