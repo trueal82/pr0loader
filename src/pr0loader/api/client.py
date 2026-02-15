@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from pr0loader.config import Settings
 from pr0loader.models import Item, ItemsResponse, ItemInfoResponse, Tag, Comment
@@ -26,12 +28,28 @@ class APIClient:
         )
 
     def _create_session(self) -> requests.Session:
-        """Create and configure HTTP session."""
+        """Create and configure HTTP session with appropriate connection pool."""
         session = requests.Session()
+
+        # Configure connection pool size to match parallel workers
+        # This prevents "Connection pool is full, discarding connection" warnings
+        pool_size = max(self.settings.max_parallel_requests + 5, 20)  # Add buffer
+
+        adapter = HTTPAdapter(
+            pool_connections=pool_size,
+            pool_maxsize=pool_size,
+            max_retries=0,  # We handle retries ourselves
+        )
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+
+        # Set cookies for authentication
         session.cookies.update({
             "me": self.settings.me,
             "pp": self.settings.pp,
         })
+
+        logger.debug(f"Created session with connection pool size: {pool_size}")
         return session
 
     def _request(self, url: str) -> dict:
@@ -41,7 +59,11 @@ class APIClient:
         while tries < self.settings.max_retries:
             tries += 1
             try:
-                logger.debug(f"Request {tries}/{self.settings.max_retries}: {url}")
+                # Only log on first try at TRACE level (effectively disabled)
+                # Log retries at DEBUG level
+                if tries > 1:
+                    logger.debug(f"Retry {tries}/{self.settings.max_retries}: {url}")
+
                 response = self.session.get(url, timeout=self.settings.request_timeout)
                 response.raise_for_status()
                 self.backoff.reset()

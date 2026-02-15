@@ -1,4 +1,13 @@
-"""Train pipeline - train tag prediction model."""
+"""Train pipeline - train tag prediction model.
+
+Reads Parquet datasets from prepare pipeline with pre-processed images.
+Images are already:
+- Resized to target size (224x224)
+- Preprocessed for ResNet50 (RGB->BGR, ImageNet mean subtracted)
+- Stored as float32 arrays
+
+No image manipulation happens here - that's all done in prepare.
+"""
 
 import json
 import logging
@@ -6,7 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-import pandas as pd
+import pyarrow.parquet as pq
 
 from pr0loader.config import Settings
 from pr0loader.utils.console import (
@@ -23,7 +32,11 @@ logger = logging.getLogger(__name__)
 
 
 class TrainPipeline:
-    """Pipeline stage for training the tag prediction model."""
+    """Pipeline stage for training the tag prediction model.
+
+    Reads Parquet datasets prepared by PreparePipeline.
+    Images must be pre-processed and embedded in the Parquet file.
+    """
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -66,12 +79,90 @@ class TrainPipeline:
                 print_info("For GPU support: Install CUDA toolkit first, then tensorflow")
             return False
 
-    def run(self, csv_path: Path, output_path: Optional[Path] = None) -> Optional[Path]:
+    def _load_parquet_dataset(self, parquet_path: Path) -> tuple[np.ndarray, np.ndarray, int, tuple[int, int]]:
+        """
+        Load dataset from Parquet file with embedded images.
+
+        Returns:
+            Tuple of (images_array, labels_array, num_classes, image_size)
+        """
+        print_info(f"Loading Parquet dataset: {parquet_path}")
+
+        # Check metadata for image format
+        meta_path = parquet_path.with_suffix('.meta.json')
+        if meta_path.exists():
+            with open(meta_path) as f:
+                metadata = json.load(f)
+
+            if not metadata.get('images_embedded', False):
+                print_error("Dataset does not contain embedded images!")
+                print_error("Run 'pr0loader prepare' to create a dataset with embedded images.")
+                raise ValueError("Dataset missing embedded images")
+
+            image_format = metadata.get('image_format', {})
+            image_size = tuple(metadata.get('image_size', [224, 224]))
+            print_info(f"Image format: {image_format.get('dtype', 'unknown')}, "
+                      f"size: {image_size}, preprocessing: {image_format.get('preprocessing', 'unknown')}")
+        else:
+            print_warning("No metadata file found - assuming default image format")
+            image_size = (224, 224)
+
+        # Read Parquet file
+        table = pq.read_table(parquet_path)
+
+        # Check for required columns
+        columns = table.column_names
+        if 'image_data' not in columns:
+            print_error("Dataset does not contain 'image_data' column!")
+            print_error("Run 'pr0loader prepare' to create a dataset with embedded images.")
+            raise ValueError("Dataset missing image_data column")
+
+        tags_list = table.column('tags').to_pylist()
+        image_data_list = table.column('image_data').to_pylist()
+
+        print_info(f"Loaded {len(tags_list):,} samples")
+
+        # Build tag vocabulary from all tags in dataset
+        all_tags = set()
+        for tags in tags_list:
+            all_tags.update(tags)
+
+        unique_tags = sorted(all_tags)
+        self.tag_to_idx = {tag: idx for idx, tag in enumerate(unique_tags)}
+        self.idx_to_tag = {idx: tag for tag, idx in self.tag_to_idx.items()}
+        num_classes = len(unique_tags)
+
+        print_info(f"Number of unique tags (classes): {num_classes}")
+
+        # Encode tags to multi-hot vectors
+        labels = np.zeros((len(tags_list), num_classes), dtype=np.float32)
+        for i, tags in enumerate(tags_list):
+            for tag in tags:
+                if tag in self.tag_to_idx:
+                    labels[i, self.tag_to_idx[tag]] = 1.0
+
+        # Reconstruct images from bytes
+        # Images are stored as raw float32 bytes, shape (H, W, 3)
+        print_info("Reconstructing images from embedded data...")
+        h, w = image_size
+        images = np.zeros((len(image_data_list), h, w, 3), dtype=np.float32)
+
+        for i, img_bytes in enumerate(image_data_list):
+            # Reconstruct from raw bytes
+            arr = np.frombuffer(img_bytes, dtype=np.float32).reshape(h, w, 3)
+            images[i] = arr
+
+        print_info(f"Images array shape: {images.shape}, dtype: {images.dtype}")
+        print_info(f"Memory usage: {images.nbytes / 1024**3:.2f} GB")
+
+        return images, labels, num_classes, image_size
+
+    def run(self, dataset_path: Path, output_path: Optional[Path] = None) -> Optional[Path]:
         """
         Run the training pipeline.
 
         Args:
-            csv_path: Path to training CSV file
+            dataset_path: Path to training dataset (Parquet with embedded images)
             output_path: Optional path for model output
 
         Returns:
@@ -93,70 +184,30 @@ class TrainPipeline:
         np.random.seed(42)
         tf.random.set_seed(42)
 
-        # Load dataset
-        print_info(f"Loading dataset: {csv_path}")
-        try:
-            df = pd.read_csv(csv_path)
-        except Exception as e:
-            print_error(f"Failed to load CSV: {e}")
+        # Load dataset - only Parquet with embedded images is supported
+        if dataset_path.suffix != '.parquet':
+            print_error("Only Parquet datasets with embedded images are supported.")
+            print_error("Run 'pr0loader prepare' to create a dataset.")
             return None
 
-        df = df[df['image'].notnull()]
+        try:
+            images, labels, num_classes, image_size = self._load_parquet_dataset(dataset_path)
+        except Exception as e:
+            print_error(f"Failed to load dataset: {e}")
+            return None
 
         # Apply dev mode limit
         if self.settings.dev_mode:
-            df = df.head(self.settings.dev_limit)
-            print_warning(f"Dev mode: using {len(df)} samples")
+            limit = min(self.settings.dev_limit, len(images))
+            images = images[:limit]
+            labels = labels[:limit]
+            print_warning(f"Dev mode: using {len(images)} samples")
 
-        print_info(f"Loaded {len(df)} samples")
-
-        # Build tag vocabulary
-        tag_columns = [f'tag{i}' for i in range(1, 6)]
-        all_tags = df[tag_columns].values.flatten()
-        unique_tags = sorted(set(tag for tag in all_tags if pd.notnull(tag)))
-
-        self.tag_to_idx = {tag: idx for idx, tag in enumerate(unique_tags)}
-        self.idx_to_tag = {idx: tag for tag, idx in self.tag_to_idx.items()}
-        num_classes = len(unique_tags)
-
-        print_info(f"Number of unique tags (classes): {num_classes}")
-
-        # Encode tags to multi-hot vectors
-        def encode_tags(row):
-            tags = [row[f'tag{i}'] for i in range(1, 6) if pd.notnull(row.get(f'tag{i}'))]
-            indices = [self.tag_to_idx[tag] for tag in tags if tag in self.tag_to_idx]
-            multi_hot = np.zeros(num_classes, dtype=np.float32)
-            multi_hot[indices] = 1.0
-            return multi_hot
-
-        print_info("Encoding tags...")
-        df['labels'] = df.apply(encode_tags, axis=1)
-
-        # Prepare image paths
-        image_paths = df['image'].apply(
-            lambda x: str(self.settings.filesystem_prefix / x)
-        ).values
-        labels = np.stack(df['labels'].values)
-
-        # Create TensorFlow dataset
+        # Create TensorFlow dataset directly from numpy arrays
+        # No image preprocessing needed - it's already done in prepare!
         print_info("Creating TensorFlow dataset...")
-        dataset = tf.data.Dataset.from_tensor_slices((image_paths, labels))
-
-        image_size = self.settings.image_size
-
-        def load_and_preprocess(path, label):
-            try:
-                image = tf.io.read_file(path)
-                image = tf.image.decode_jpeg(image, channels=3)
-                image = tf.image.resize(image, image_size)
-                image = keras.applications.resnet50.preprocess_input(image)
-                return image, label
-            except Exception:
-                # Return a black image if loading fails
-                return tf.zeros((*image_size, 3)), label
-
-        dataset = dataset.map(load_and_preprocess, num_parallel_calls=tf.data.AUTOTUNE)
-        dataset = dataset.shuffle(buffer_size=1000, seed=42)
+        dataset = tf.data.Dataset.from_tensor_slices((images, labels))
+        dataset = dataset.shuffle(buffer_size=min(1000, len(images)), seed=42)
         dataset = dataset.batch(self.settings.batch_size)
         dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
 
@@ -206,18 +257,9 @@ class TrainPipeline:
         print_info(f"Starting training for {self.settings.num_epochs} epochs...")
         print_info(f"Batch size: {self.settings.batch_size}")
         print_info(f"Learning rate: {self.settings.learning_rate}")
-
-        # Verbose logging: show dataset sample
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"Dataset: {len(df)} samples")
-            logger.debug(f"Image size: {image_size}")
-            logger.debug(f"Classes: {num_classes} unique tags")
-            # Show some example tags
-            example_tags = list(self.tag_to_idx.keys())[:10]
-            logger.debug(f"Example tags: {', '.join(example_tags)}")
+        print_info(f"Image size: {image_size}")
 
         try:
-            # Use verbose=2 for detailed epoch progress when verbose logging is on
             verbosity = 2 if logger.isEnabledFor(logging.DEBUG) else (1 if not is_headless() else 2)
 
             history = model.fit(
@@ -246,6 +288,7 @@ class TrainPipeline:
                 'tag_to_idx': self.tag_to_idx,
                 'idx_to_tag': {str(k): v for k, v in self.idx_to_tag.items()},
                 'num_classes': num_classes,
+                'image_size': list(image_size),
             }, f, indent=2)
 
         print_info(f"Saved tag mapping to {mapping_path}")

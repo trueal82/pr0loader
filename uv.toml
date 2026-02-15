@@ -1,0 +1,6 @@
+# UV configuration for pr0loader
+# See: https://docs.astral.sh/uv/
+
+[pip]
+# Compile Python files to bytecode for faster startup
+compile-bytecode = true

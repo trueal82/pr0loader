@@ -40,34 +40,55 @@ app = typer.Typer(
     rich_markup_mode="rich",
 )
 
+# Silence noisy third-party loggers early (before any requests are made)
+# These generate thousands of messages during parallel fetches
+for _noisy_logger in ['urllib3', 'urllib3.connectionpool', 'requests', 'httpcore', 'httpx']:
+    logging.getLogger(_noisy_logger).setLevel(logging.WARNING)
+
 
 def setup_logging(verbose: bool, headless: bool):
     """Configure logging based on options."""
     level = logging.DEBUG if verbose else logging.INFO
 
+    # Get root logger
+    root_logger = logging.getLogger()
+
+    # Clear existing handlers to allow reconfiguration
+    if root_logger.handlers:
+        for handler in root_logger.handlers[:]:
+            root_logger.removeHandler(handler)
+
     if headless:
         # Simple format for headless mode
-        logging.basicConfig(
-            level=level,
-            format='[%(asctime)s] %(levelname)s - %(message)s',
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(
+            '[%(asctime)s] %(levelname)s - %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
-        )
+        ))
+        root_logger.addHandler(handler)
+        root_logger.setLevel(level)
     else:
         # Use Rich handler for better integration with progress bars
         from rich.logging import RichHandler
 
-        logging.basicConfig(
-            level=level if verbose else logging.WARNING,
-            format='%(message)s',
-            datefmt='%H:%M:%S',
-            handlers=[RichHandler(
-                console=console,
-                rich_tracebacks=True,
-                show_time=verbose,
-                show_path=verbose,
-                markup=True,
-            )]
+        handler = RichHandler(
+            console=console,
+            rich_tracebacks=True,
+            show_time=verbose,
+            show_path=verbose,
+            markup=True,
         )
+        root_logger.addHandler(handler)
+        root_logger.setLevel(level if verbose else logging.WARNING)
+
+    # Set level for pr0loader loggers specifically
+    for name in ['pr0loader', 'pr0loader.pipeline', 'pr0loader.api', 'pr0loader.storage']:
+        logging.getLogger(name).setLevel(level)
+
+    # Silence noisy third-party loggers even in verbose mode
+    # These generate thousands of messages during parallel fetches
+    for noisy_logger in ['urllib3', 'urllib3.connectionpool', 'requests', 'httpcore']:
+        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 
     set_headless(headless)
 
@@ -1014,9 +1035,15 @@ def fetch(
     ctx: typer.Context,
     full_update: bool = typer.Option(False, "--full", "-f", help="Perform full update (re-fetch all)"),
     start_from: Optional[int] = typer.Option(None, "--start-from", "-s", help="Start from specific ID"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose logging"),
+    headless: bool = typer.Option(False, "--headless", "-H", help="Run without fancy output"),
 ):
     """📥 Fetch metadata from pr0gramm API."""
-    headless = ctx.obj.get("headless", False)
+    # Allow command-level options to override context
+    if verbose or ctx.obj.get("verbose", False):
+        setup_logging(True, headless or ctx.obj.get("headless", False))
+    headless = headless or ctx.obj.get("headless", False)
+
     if not headless:
         show_banner()
 
@@ -1045,13 +1072,21 @@ def fetch(
 def download(
     ctx: typer.Context,
     include_videos: bool = typer.Option(False, "--include-videos", "-V", help="Also download videos (default: images only)"),
+    verify: bool = typer.Option(False, "--verify", help="Verify existing files with HEAD request, re-download if size differs"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose logging"),
+    headless: bool = typer.Option(False, "--headless", "-H", help="Run without fancy output"),
 ):
     """📁 Download media files from pr0gramm.
 
     By default, only images (jpg, jpeg, png, gif) are downloaded.
     Use --include-videos to also download video files.
+    Use --verify to check existing files and re-download if corrupted.
     """
-    headless = ctx.obj.get("headless", False)
+    # Allow command-level options to override context
+    if verbose or ctx.obj.get("verbose", False):
+        setup_logging(True, headless or ctx.obj.get("headless", False))
+    headless = headless or ctx.obj.get("headless", False)
+
     if not headless:
         show_banner()
 
@@ -1064,7 +1099,7 @@ def download(
 
         from pr0loader.pipeline import DownloadPipeline
         pipeline = DownloadPipeline(settings)
-        pipeline.run(include_videos=include_videos)
+        pipeline.run(include_videos=include_videos, verify_existing=verify)
 
     except Exception as e:
         print_error(f"Download failed: {e}")
@@ -1079,6 +1114,8 @@ def sync(
     include_videos: bool = typer.Option(False, "--include-videos", "-V", help="Also download videos (default: images only)"),
     verify: bool = typer.Option(True, "--verify/--no-verify", help="Verify existing files with HEAD request"),
     metadata_only: bool = typer.Option(False, "--metadata-only", "-m", help="Only fetch metadata, skip downloads"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose logging"),
+    headless: bool = typer.Option(False, "--headless", "-H", help="Run without fancy output"),
 ):
     """🔄 Full sync: fetch metadata and download assets in one run.
 
@@ -1086,7 +1123,11 @@ def sync(
     By default, only images are downloaded. Use --include-videos to also download videos.
     Existing files are verified via HEAD request - only re-downloaded if size differs.
     """
-    headless = ctx.obj.get("headless", False)
+    # Allow command-level options to override context
+    if verbose or ctx.obj.get("verbose", False):
+        setup_logging(True, headless or ctx.obj.get("headless", False))
+    headless = headless or ctx.obj.get("headless", False)
+
     if not headless:
         show_banner()
 
@@ -1118,13 +1159,48 @@ def sync(
 @app.command()
 def prepare(
     ctx: typer.Context,
-    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Output CSV file path"),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Output Parquet file path"),
     min_tags: int = typer.Option(5, "--min-tags", "-t", help="Minimum valid tags per item"),
+    wait: bool = typer.Option(False, "--wait", "-w", help="Wait for any running fetch/sync to complete"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose logging"),
+    headless: bool = typer.Option(False, "--headless", "-H", help="Run without fancy output"),
 ):
-    """📊 Prepare dataset for ML training."""
-    headless = ctx.obj.get("headless", False)
+    """📊 Prepare dataset for ML training.
+
+    Processes the database and generates a Parquet file with:
+    - Filtered and normalized tags (data-driven thresholds)
+    - Preprocessed images embedded (224x224, ResNet50 format)
+
+    The output file can be used directly with 'pr0loader train'.
+    Note: Running while fetch is active will be slow due to database locks.
+    Use --wait to automatically wait for fetch to complete first.
+    """
+    import subprocess
+    import time
+
+    # Allow command-level options to override context
+    if verbose or ctx.obj.get("verbose", False):
+        setup_logging(True, headless or ctx.obj.get("headless", False))
+    headless = headless or ctx.obj.get("headless", False)
+
     if not headless:
         show_banner()
+
+    # Wait for concurrent fetch/sync if requested
+    if wait:
+        while True:
+            try:
+                result = subprocess.run(
+                    ['pgrep', '-f', 'pr0loader.*(fetch|sync)'],
+                    capture_output=True,
+                    text=True
+                )
+                if result.returncode != 0 or not result.stdout.strip():
+                    break
+                print_info("Waiting for fetch/sync to complete...")
+                time.sleep(5)
+            except Exception:
+                break
 
     try:
         settings = load_settings()
@@ -1144,19 +1220,35 @@ def prepare(
 @app.command()
 def train(
     ctx: typer.Context,
-    dataset: Path = typer.Argument(..., help="Path to training CSV file"),
+    dataset: Path = typer.Argument(..., help="Path to training dataset (Parquet or CSV)"),
     output: Optional[Path] = typer.Option(None, "--output", "-o", help="Output model path"),
     epochs: int = typer.Option(5, "--epochs", "-e", help="Number of training epochs"),
     batch_size: int = typer.Option(128, "--batch-size", "-b", help="Training batch size"),
     dev_mode: bool = typer.Option(False, "--dev", "-d", help="Development mode (use subset of data)"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose logging"),
+    headless: bool = typer.Option(False, "--headless", "-H", help="Run without fancy output"),
 ):
-    """🧠 Train tag prediction model."""
-    headless = ctx.obj.get("headless", False)
+    """🧠 Train tag prediction model.
+
+    Accepts both Parquet (recommended) and CSV datasets.
+    Use 'pr0loader prepare' to generate a dataset first.
+    """
+    # Allow command-level options to override context
+    if verbose or ctx.obj.get("verbose", False):
+        setup_logging(True, headless or ctx.obj.get("headless", False))
+    headless = headless or ctx.obj.get("headless", False)
+
     if not headless:
         show_banner()
 
     if not dataset.exists():
         print_error(f"Dataset not found: {dataset}")
+        raise typer.Exit(1)
+
+    # Validate file format
+    if dataset.suffix not in ['.parquet', '.csv']:
+        print_error(f"Unsupported dataset format: {dataset.suffix}")
+        print_info("Supported formats: .parquet (recommended), .csv")
         raise typer.Exit(1)
 
     try:
@@ -1184,9 +1276,15 @@ def predict(
     model: Optional[Path] = typer.Option(None, "--model", "-m", help="Path to trained model"),
     top_k: int = typer.Option(5, "--top", "-k", help="Number of top tags to show"),
     json_output: bool = typer.Option(False, "--json", "-j", help="Output results as JSON"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose logging"),
+    headless: bool = typer.Option(False, "--headless", "-H", help="Run without fancy output"),
 ):
     """🔮 Predict tags for images."""
-    headless = ctx.obj.get("headless", False)
+    # Allow command-level options to override context
+    if verbose or ctx.obj.get("verbose", False):
+        setup_logging(True, headless or ctx.obj.get("headless", False))
+    headless = headless or ctx.obj.get("headless", False)
+
     if not headless and not json_output:
         show_banner()
 

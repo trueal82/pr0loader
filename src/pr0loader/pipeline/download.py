@@ -37,12 +37,14 @@ class DownloadPipeline:
         self.api = APIClient(settings)
         self.stats = PipelineStats()
 
-    def run(self, include_videos: bool = False) -> PipelineStats:
+    def run(self, include_videos: bool = False, verify_existing: bool = False) -> PipelineStats:
         """
         Run the download pipeline.
 
         Args:
             include_videos: If True, also download videos. Default is images only.
+            verify_existing: If True, verify existing files via HEAD request and
+                           re-download if size differs. Default is False (skip existing).
         """
         print_header(
             "📁 Download Media",
@@ -54,6 +56,7 @@ class DownloadPipeline:
         media_dir.mkdir(parents=True, exist_ok=True)
         print_info(f"Media directory: {media_dir}")
         print_info(f"Download mode: {'All media (images + videos)' if include_videos else 'Images only'}")
+        print_info(f"Verify existing: {'Yes (HEAD check)' if verify_existing else 'No (skip existing)'}")
 
         with SQLiteStorage(self.settings.db_path) as storage:
             total_items = storage.get_item_count()
@@ -85,38 +88,32 @@ class DownloadPipeline:
                         ext = Path(item.image).suffix.lower()
                         if ext not in {'.jpg', '.jpeg', '.png', '.gif'}:
                             self.stats.items_skipped += 1
-                            if logger.isEnabledFor(logging.DEBUG):
-                                logger.debug(f"Skipped video: {item.image}")
                             continue
 
                     # Build paths
                     destination = media_dir / item.image
 
-                    # Skip if already exists
+                    # Check if we need to download
                     if destination.exists():
-                        self.stats.files_skipped += 1
-                        if logger.isEnabledFor(logging.DEBUG) and self.stats.files_skipped % 50 == 1:
-                            logger.debug(f"File exists (#{self.stats.files_skipped}): {destination.name}")
-                        continue
+                        if verify_existing:
+                            # Verify via HEAD request
+                            if not self.api.needs_download(item.image, destination):
+                                self.stats.files_skipped += 1
+                                continue
+                            # Size mismatch - will re-download
+                        else:
+                            # Skip existing files without verification
+                            self.stats.files_skipped += 1
+                            continue
 
                     try:
-                        # Verbose: show what we're about to download
-                        if logger.isEnabledFor(logging.DEBUG):
-                            logger.debug(f"Downloading: {item.image}")
-
                         # Download file
                         size = self.api.download_media(item.image, destination)
                         self.stats.files_downloaded += 1
                         self.stats.bytes_downloaded += size
 
-                        # Verbose logging: show download details
-                        if logger.isEnabledFor(logging.DEBUG):
-                            logger.debug(
-                                f"✓ Downloaded {item.image} ({format_bytes(size)})"
-                            )
-
                     except Exception as e:
-                        logger.error(f"✗ Failed to download {item.image}: {e}")
+                        logger.error(f"Failed to download {item.image}: {e}")
                         self.stats.items_failed += 1
 
             # Print final stats
