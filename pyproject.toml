@@ -40,13 +40,27 @@ ml = [
     "tensorflow>=2.15.0",
     "pillow>=10.0.0",
 ]
+api = [
+    "fastapi>=0.109.0",
+    "uvicorn[standard]>=0.27.0",
+    "python-multipart>=0.0.6",
+]
+ui = [
+    "gradio>=4.0.0",
+    "pillow>=10.0.0",
+]
+auth = [
+    "keyring>=24.0.0",
+    "pycryptodome>=3.19.0",
+    "pillow>=10.0.0",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "black>=23.0.0",
     "ruff>=0.1.0",
 ]
-all = ["pr0loader[ml,dev]"]
+all = ["pr0loader[ml,api,ui,auth,dev]"]
 
 [project.scripts]
 pr0loader = "pr0loader.cli:app"

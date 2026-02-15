@@ -8,6 +8,15 @@ numpy>=1.24.0
 pydantic>=2.0.0
 pydantic-settings>=2.0.0
 
-# Optional ML dependencies (uncomment if needed)
+# API dependencies (for `pr0loader api` command)
+# fastapi>=0.109.0
+# uvicorn[standard]>=0.27.0
+# python-multipart>=0.0.6
+
+# UI dependencies (for `pr0loader ui` command)
+# gradio>=4.0.0
+# pillow>=10.0.0
+
+# ML dependencies (for training and prediction)
 # tensorflow>=2.15.0
 # pillow>=10.0.0

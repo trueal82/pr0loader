@@ -62,6 +62,67 @@ def setup_logging(verbose: bool, headless: bool):
     set_headless(headless)
 
 
+def check_setup(headless: bool = False) -> bool:
+    """
+    Check if setup is needed and run wizard if interactive.
+
+    Returns:
+        True if setup is complete, False otherwise.
+    """
+    from pr0loader.utils.setup import env_file_exists, check_and_run_setup
+
+    if env_file_exists():
+        return True
+
+    if headless:
+        console.print("[yellow]No .env file found. Run 'pr0loader setup' first.[/yellow]")
+        return False
+
+
+def check_auth_for_content_flags(settings: "Settings", headless: bool = False) -> bool:
+    """
+    Check if authentication is available when content flags require it.
+
+    Content flags > 1 means non-SFW content, which requires authentication.
+
+    Returns:
+        True if auth is available or not needed, False if auth is required but missing.
+    """
+    # SFW only (flags=1) doesn't require auth
+    if settings.content_flags == 1:
+        return True
+
+    # Check if we have cookies in settings
+    if settings.pp and settings.me:
+        return True
+
+    # Check if we have stored credentials
+    try:
+        from pr0loader.auth import get_auth_manager
+        auth = get_auth_manager()
+        creds = auth.store.load()
+        if creds and creds.is_valid():
+            return True
+    except Exception:
+        pass
+
+    # No auth available
+    if headless:
+        console.print("[red]Error: Authentication required for content flags > 1[/red]")
+        console.print("[yellow]Content flags are set to {}, which includes non-SFW content.[/yellow]".format(settings.content_flags))
+        console.print("[yellow]Run 'pr0loader login' first, or set CONTENT_FLAGS=1 for SFW only.[/yellow]")
+    else:
+        print_error("Authentication required for content flags > 1")
+        print_warning(f"Content flags are set to {settings.content_flags}, which includes non-SFW content.")
+        print_info("Options:")
+        print_info("  1. Run 'pr0loader login --auto' to authenticate")
+        print_info("  2. Set CONTENT_FLAGS=1 in .env for SFW-only content")
+
+    return False
+
+    return check_and_run_setup()
+
+
 def show_banner():
     """Show application banner."""
     banner = """
@@ -84,45 +145,158 @@ def _run_interactive(ctx: typer.Context):
         console.print("[yellow]Not running in interactive terminal. Use --help for commands.[/yellow]")
         raise typer.Exit(0)
 
-    action, options = run_interactive_menu()
-
-    if action is None:
-        console.print("\n[dim]Goodbye![/dim]")
+    # Check if setup is needed
+    if not check_setup(headless=False):
         raise typer.Exit(0)
 
-    # Execute the selected action with options
+    # Main loop - keep showing menu until quit
+    while True:
+        action, options = run_interactive_menu()
+
+        if action is None or action == "quit":
+            console.print("\n[dim]Goodbye![/dim]")
+            raise typer.Exit(0)
+
+        # Execute the selected action with options
+        try:
+            settings = load_settings()
+
+            if action == "info":
+                _execute_info()
+            elif action == "sync":
+                _execute_sync(settings, options)
+            elif action == "fetch":
+                _execute_fetch(settings, options)
+            elif action == "download":
+                _execute_download(settings, options)
+            elif action == "prepare":
+                _execute_prepare(settings, options)
+            elif action == "train":
+                _execute_train(settings, options)
+            elif action == "predict":
+                _execute_predict(settings, options)
+            elif action == "api":
+                _execute_api(settings, options)
+            elif action == "ui":
+                _execute_ui(settings, options)
+            elif action == "serve":
+                _execute_serve(settings, options)
+            elif action == "login":
+                _execute_login(options)
+            elif action == "logout":
+                _execute_logout()
+            elif action == "setup":
+                _execute_setup()
+
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Interrupted[/yellow]")
+        except Exception as e:
+            print_error(f"Error: {e}")
+
+        # Pause before returning to menu
+        console.print()
+        from rich.prompt import Prompt
+        Prompt.ask("[dim]Press Enter to return to menu[/dim]", default="")
+
+
+def _execute_info():
+    """Execute info command from interactive menu."""
+    # Show banner already shown by menu, so just run info logic
+    print_header("System Information", "Database and configuration overview")
+
     try:
         settings = load_settings()
 
-        if action == "info":
-            _execute_info(ctx)
-        elif action == "sync":
-            _execute_sync(settings, options)
-        elif action == "fetch":
-            _execute_fetch(settings, options)
-        elif action == "download":
-            _execute_download(settings, options)
-        elif action == "prepare":
-            _execute_prepare(settings, options)
-        elif action == "train":
-            _execute_train(settings, options)
-        elif action == "predict":
-            _execute_predict(settings, options)
-        elif action == "run-all":
-            _execute_run_all(settings, options)
+        # Data directory table
+        dir_table = Table(title="Data Directory Structure", box=box.ROUNDED)
+        dir_table.add_column("Path Type", style="cyan")
+        dir_table.add_column("Location", style="green")
+        dir_table.add_column("Status", style="yellow")
+
+        def path_status(p: Path) -> str:
+            if p.exists():
+                if p.is_dir():
+                    return "✓ exists"
+                elif p.is_file():
+                    size = p.stat().st_size
+                    if size > 1024 * 1024:
+                        return f"✓ {size / 1024 / 1024:.1f} MB"
+                    elif size > 1024:
+                        return f"✓ {size / 1024:.1f} KB"
+                    return f"✓ {size} B"
+            return "✗ not found"
+
+        dir_table.add_row("Base data dir", str(settings.data_dir), path_status(settings.data_dir))
+        dir_table.add_row("Database", str(settings.db_path), path_status(settings.db_path))
+        dir_table.add_row("Media files", str(settings.filesystem_prefix), path_status(settings.filesystem_prefix))
+        dir_table.add_row("Output/datasets", str(settings.output_dir), path_status(settings.output_dir))
+        dir_table.add_row("Models", str(settings.model_path.parent), path_status(settings.model_path.parent))
+        dir_table.add_row("Trained model", str(settings.model_path), path_status(settings.model_path))
+        dir_table.add_row("Auth/credentials", str(settings.auth_dir), path_status(settings.auth_dir))
+
+        console.print(dir_table)
+        console.print()
+
+        # Configuration table
+        config_table = Table(title="Configuration", box=box.ROUNDED)
+        config_table.add_column("Setting", style="cyan")
+        config_table.add_column("Value", style="green")
+
+        config_table.add_row("Content flags", str(settings.content_flags))
+        config_table.add_row("Dev mode", "✓ Yes" if settings.dev_mode else "✗ No")
+
+        console.print(config_table)
+        console.print()
+
+        # Database stats
+        if settings.db_path.exists():
+            from pr0loader.storage import SQLiteStorage
+
+            with SQLiteStorage(settings.db_path) as storage:
+                db_table = Table(title="Database Statistics", box=box.ROUNDED)
+                db_table.add_column("Metric", style="cyan")
+                db_table.add_column("Value", style="green", justify="right")
+
+                item_count = storage.get_item_count()
+                min_id = storage.get_min_id()
+                max_id = storage.get_max_id()
+
+                db_table.add_row("Total items", f"{item_count:,}")
+                db_table.add_row("ID range", f"{min_id:,} - {max_id:,}")
+
+                # Top tags
+                top_tags = storage.get_tag_counts(limit=10)
+                if top_tags:
+                    tags_str = ", ".join(f"{t}({c})" for t, c in top_tags[:5])
+                    db_table.add_row("Top tags", tags_str)
+
+                console.print(db_table)
+        else:
+            print_warning(f"Database not found: {settings.db_path}")
+
+        # Model info
+        console.print()
+        if settings.model_path.exists():
+            print_success(f"Model found: {settings.model_path}")
+            mapping_path = settings.model_path.with_suffix('.tags.json')
+            if mapping_path.exists():
+                import json
+                with open(mapping_path) as f:
+                    mapping = json.load(f)
+                print_info(f"Model has {mapping.get('num_classes', '?')} tag classes")
+        else:
+            print_warning(f"No trained model found at: {settings.model_path}")
 
     except Exception as e:
-        print_error(f"Error: {e}")
-        raise typer.Exit(1)
-
-
-def _execute_info(ctx: typer.Context):
-    """Execute info command."""
-    ctx.invoke(info)
+        print_error(f"Failed to load settings: {e}")
 
 
 def _execute_sync(settings: Settings, options: dict):
     """Execute sync with options from interactive menu."""
+    # Check auth if content flags require it
+    if not check_auth_for_content_flags(settings, headless=False):
+        return
+
     if options.get("full"):
         settings.full_update = True
     if options.get("start_from"):
@@ -139,6 +313,10 @@ def _execute_sync(settings: Settings, options: dict):
 
 def _execute_fetch(settings: Settings, options: dict):
     """Execute fetch with options from interactive menu."""
+    # Check auth if content flags require it
+    if not check_auth_for_content_flags(settings, headless=False):
+        return
+
     if options.get("full"):
         settings.full_update = True
     if options.get("start_from"):
@@ -151,6 +329,10 @@ def _execute_fetch(settings: Settings, options: dict):
 
 def _execute_download(settings: Settings, options: dict):
     """Execute download with options from interactive menu."""
+    # Check auth if content flags require it
+    if not check_auth_for_content_flags(settings, headless=False):
+        return
+
     from pr0loader.pipeline import DownloadPipeline
     pipeline = DownloadPipeline(settings)
     pipeline.run(include_videos=options.get("include_videos", False))
@@ -251,6 +433,134 @@ def _execute_run_all(settings: Settings, options: dict):
     print_header("🎉 Pipeline Complete!", "All stages finished successfully")
 
 
+def _execute_login(options: dict):
+    """Execute login with options from interactive menu."""
+    from pr0loader.auth import get_auth_manager
+
+    print_header("🔐 Login", "Authenticating with pr0gramm")
+
+    auth = get_auth_manager()
+    credentials = None
+    method = options.get("method", "auto")
+
+    if method == "auto":
+        print_info("Trying to extract cookies from browsers...")
+        credentials = auth.get_credentials(auto_login=True)
+    elif method == "browser":
+        browser = options.get("browser", "firefox")
+        print_info(f"Extracting from {browser}...")
+        credentials = auth.extract_from_browser(browser)
+    elif method == "interactive":
+        print_info("Starting interactive login...")
+        credentials = auth.login_interactive()
+
+    if credentials:
+        print_success(f"Logged in as: {credentials.username}")
+        print_info(f"NSFW Access: {'Yes' if credentials.is_verified else 'No'}")
+    else:
+        print_error("Login failed")
+
+
+def _execute_logout():
+    """Execute logout."""
+    from pr0loader.auth import get_auth_manager
+
+    auth = get_auth_manager()
+    if auth.logout():
+        print_success("Logged out successfully")
+    else:
+        print_warning("No credentials to clear")
+
+
+def _execute_setup():
+    """Execute setup wizard."""
+    from pr0loader.utils.setup import run_setup_wizard
+    run_setup_wizard()
+
+
+def _execute_api(settings: Settings, options: dict):
+    """Execute API server with options from interactive menu."""
+    print_header("🌐 Starting API Server", f"http://{options.get('host', '0.0.0.0')}:{options.get('port', 8000)}")
+
+    import uvicorn
+    from pr0loader.api.server import create_app
+
+    model_path = Path(options["model"]) if options.get("model") else None
+    app_instance = create_app(model_path=model_path)
+
+    print_info(f"API documentation: http://{options.get('host', '0.0.0.0')}:{options.get('port', 8000)}/docs")
+    print_info("Press Ctrl+C to stop")
+    console.print()
+
+    uvicorn.run(
+        app_instance,
+        host=options.get("host", "0.0.0.0"),
+        port=options.get("port", 8000),
+        log_level="info",
+    )
+
+
+def _execute_ui(settings: Settings, options: dict):
+    """Execute Gradio UI with options from interactive menu."""
+    from pr0loader.api.gradio_ui import launch_gradio
+
+    mode = "Remote API" if options.get("api_url") else "Local Model"
+    print_header("🎨 Starting Gradio UI", f"Mode: {mode}")
+
+    model_path = Path(options["model"]) if options.get("model") else None
+
+    print_info(f"Web UI: http://{options.get('host', '0.0.0.0')}:{options.get('port', 7860)}")
+    if options.get("api_url"):
+        print_info(f"Using API: {options['api_url']}")
+    print_info("Press Ctrl+C to stop")
+    console.print()
+
+    launch_gradio(
+        model_path=model_path,
+        api_url=options.get("api_url"),
+        host=options.get("host", "0.0.0.0"),
+        port=options.get("port", 7860),
+        share=options.get("share", False),
+    )
+
+
+def _execute_serve(settings: Settings, options: dict):
+    """Execute combined API + UI server with options from interactive menu."""
+    import threading
+    import uvicorn
+    from pr0loader.api.server import create_app
+    from pr0loader.api.gradio_ui import launch_gradio
+
+    host = options.get("host", "0.0.0.0")
+    api_port = options.get("api_port", 8000)
+    ui_port = options.get("ui_port", 7860)
+
+    print_header("🚀 Starting Full Server", "API + Gradio UI")
+    print_info(f"API Server: http://{host}:{api_port}")
+    print_info(f"Web UI: http://{host}:{ui_port}")
+    print_info("Press Ctrl+C to stop")
+    console.print()
+
+    model_path = Path(options["model"]) if options.get("model") else None
+    api_app = create_app(model_path=model_path)
+
+    def run_api():
+        uvicorn.run(api_app, host=host, port=api_port, log_level="warning")
+
+    api_thread = threading.Thread(target=run_api, daemon=True)
+    api_thread.start()
+
+    print_success("API server started")
+
+    api_url = f"http://{host}:{api_port}"
+    launch_gradio(
+        api_url=api_url,
+        host=host,
+        port=ui_port,
+        share=False,
+    )
+
+
 # Common options
 def common_options(
     headless: bool = typer.Option(False, "--headless", "-H", help="Run without fancy output (for scripts/CI)"),
@@ -296,14 +606,41 @@ def info(
     try:
         settings = load_settings()
 
+        # Data directory table
+        dir_table = Table(title="Data Directory Structure", box=box.ROUNDED)
+        dir_table.add_column("Path Type", style="cyan")
+        dir_table.add_column("Location", style="green")
+        dir_table.add_column("Status", style="yellow")
+
+        def path_status(p: Path) -> str:
+            if p.exists():
+                if p.is_dir():
+                    return "✓ exists"
+                elif p.is_file():
+                    size = p.stat().st_size
+                    if size > 1024 * 1024:
+                        return f"✓ {size / 1024 / 1024:.1f} MB"
+                    elif size > 1024:
+                        return f"✓ {size / 1024:.1f} KB"
+                    return f"✓ {size} B"
+            return "✗ not found"
+
+        dir_table.add_row("Base data dir", str(settings.data_dir), path_status(settings.data_dir))
+        dir_table.add_row("Database", str(settings.db_path), path_status(settings.db_path))
+        dir_table.add_row("Media files", str(settings.filesystem_prefix), path_status(settings.filesystem_prefix))
+        dir_table.add_row("Output/datasets", str(settings.output_dir), path_status(settings.output_dir))
+        dir_table.add_row("Models", str(settings.model_path.parent), path_status(settings.model_path.parent))
+        dir_table.add_row("Trained model", str(settings.model_path), path_status(settings.model_path))
+        dir_table.add_row("Auth/credentials", str(settings.auth_dir), path_status(settings.auth_dir))
+
+        console.print(dir_table)
+        console.print()
+
         # Configuration table
         config_table = Table(title="Configuration", box=box.ROUNDED)
         config_table.add_column("Setting", style="cyan")
         config_table.add_column("Value", style="green")
 
-        config_table.add_row("Database path", str(settings.db_path))
-        config_table.add_row("Media directory", str(settings.filesystem_prefix))
-        config_table.add_row("Model path", str(settings.model_path))
         config_table.add_row("Content flags", str(settings.content_flags))
         config_table.add_row("Dev mode", "✓ Yes" if settings.dev_mode else "✗ No")
 
@@ -351,7 +688,79 @@ def info(
 
     except Exception as e:
         print_error(f"Failed to load settings: {e}")
-        print_info("Make sure you have a .env file with required settings (PP, ME)")
+        raise typer.Exit(1)
+
+
+@app.command()
+def init(
+    ctx: typer.Context,
+):
+    """🏗️ Initialize the pr0loader data directory structure.
+
+    Creates all required directories under the configured DATA_DIR.
+    """
+    headless = ctx.obj.get("headless", False)
+    if not headless:
+        show_banner()
+
+    print_header("🏗️ Initialize", "Creating data directory structure")
+
+    try:
+        settings = load_settings()
+
+        print_info(f"Data directory: {settings.data_dir}")
+        console.print()
+
+        # Create directories
+        settings.ensure_directories()
+
+        dirs_created = [
+            ("Base data dir", settings.data_dir),
+            ("Media files", settings.filesystem_prefix),
+            ("Output/datasets", settings.output_dir),
+            ("Models", settings.model_path.parent),
+            ("Checkpoints", settings.checkpoint_dir),
+            ("Auth/credentials", settings.auth_dir),
+        ]
+
+        for name, path in dirs_created:
+            if path.exists():
+                print_success(f"{name}: {path}")
+            else:
+                print_warning(f"{name}: {path} (failed to create)")
+
+        console.print()
+        print_success("Data directory structure initialized!")
+        print_info("Run 'pr0loader login --auto' to authenticate")
+
+    except Exception as e:
+        print_error(f"Initialization failed: {e}")
+        raise typer.Exit(1)
+
+
+@app.command()
+def setup(
+    ctx: typer.Context,
+    force: bool = typer.Option(False, "--force", "-f", help="Reconfigure even if .env exists"),
+):
+    """⚙️ Run the setup wizard to create or update configuration.
+
+    Creates a .env file with your pr0loader configuration.
+    If a config already exists, shows current values as defaults.
+    """
+    headless = ctx.obj.get("headless", False)
+    if headless:
+        print_error("Setup wizard requires interactive terminal")
+        print_info("Create .env manually from template.env")
+        raise typer.Exit(1)
+
+    show_banner()
+
+    from pr0loader.utils.setup import run_setup_wizard
+
+    result = run_setup_wizard()
+
+    if not result:
         raise typer.Exit(1)
 
 
@@ -368,6 +777,11 @@ def fetch(
 
     try:
         settings = load_settings()
+
+        # Check auth if content flags require it
+        if not check_auth_for_content_flags(settings, headless):
+            raise typer.Exit(1)
+
         if full_update:
             settings.full_update = True
         if start_from:
@@ -399,6 +813,10 @@ def download(
     try:
         settings = load_settings()
 
+        # Check auth if content flags require it
+        if not check_auth_for_content_flags(settings, headless):
+            raise typer.Exit(1)
+
         from pr0loader.pipeline import DownloadPipeline
         pipeline = DownloadPipeline(settings)
         pipeline.run(include_videos=include_videos)
@@ -429,6 +847,11 @@ def sync(
 
     try:
         settings = load_settings()
+
+        # Check auth if content flags require it
+        if not check_auth_for_content_flags(settings, headless):
+            raise typer.Exit(1)
+
         if full:
             settings.full_update = True
         if start_from:
@@ -583,6 +1006,11 @@ def run_all(
         settings = load_settings()
         settings.dev_mode = dev_mode
 
+        # Check auth if content flags require it (for fetch/download steps)
+        if not skip_fetch or not skip_download:
+            if not check_auth_for_content_flags(settings, headless):
+                raise typer.Exit(1)
+
         total_steps = 4 - sum([skip_fetch, skip_download, skip_prepare, skip_train])
         current_step = 0
 
@@ -636,6 +1064,322 @@ def run_all(
         raise typer.Exit(130)
     except Exception as e:
         print_error(f"Pipeline failed: {e}")
+        raise typer.Exit(1)
+
+
+@app.command()
+def api(
+    ctx: typer.Context,
+    host: str = typer.Option("0.0.0.0", "--host", "-h", help="Host to bind to"),
+    port: int = typer.Option(8000, "--port", "-p", help="Port to listen on"),
+    model: Optional[Path] = typer.Option(None, "--model", "-m", help="Path to trained model"),
+    reload: bool = typer.Option(False, "--reload", "-r", help="Enable auto-reload (development)"),
+):
+    """🌐 Start the inference API server.
+
+    Starts a FastAPI server for tag prediction inference.
+
+    Endpoints:
+    - GET  /         - Health check
+    - GET  /health   - Health check
+    - POST /predict  - Predict tags for single image
+    - POST /predict/batch - Predict tags for multiple images
+    """
+    headless = ctx.obj.get("headless", False)
+    if not headless:
+        show_banner()
+
+    print_header("🌐 Starting API Server", f"http://{host}:{port}")
+
+    try:
+        import uvicorn
+        from pr0loader.api.server import create_app
+
+        # Create app with model path
+        app_instance = create_app(model_path=model)
+
+        print_info(f"API documentation: http://{host}:{port}/docs")
+        print_info(f"Health check: http://{host}:{port}/health")
+        print_info("Press Ctrl+C to stop")
+        console.print()
+
+        uvicorn.run(
+            app_instance,
+            host=host,
+            port=port,
+            reload=reload,
+            log_level="info",
+        )
+
+    except ImportError:
+        print_error("FastAPI/uvicorn not installed. Install with: pip install fastapi uvicorn python-multipart")
+        raise typer.Exit(1)
+    except Exception as e:
+        print_error(f"API server failed: {e}")
+        raise typer.Exit(1)
+
+
+@app.command()
+def ui(
+    ctx: typer.Context,
+    host: str = typer.Option("0.0.0.0", "--host", "-h", help="Host to bind to"),
+    port: int = typer.Option(7860, "--port", "-p", help="Port to listen on"),
+    model: Optional[Path] = typer.Option(None, "--model", "-m", help="Path to trained model"),
+    api_url: Optional[str] = typer.Option(None, "--api-url", "-a", help="Use remote API instead of local model"),
+    share: bool = typer.Option(False, "--share", "-s", help="Create public Gradio link"),
+):
+    """🎨 Start the Gradio web UI for testing.
+
+    Launches a web interface for uploading images and predicting tags.
+
+    Can run in two modes:
+    - Local: Uses the model directly (default)
+    - Remote: Connects to an API server (use --api-url)
+    """
+    headless = ctx.obj.get("headless", False)
+    if not headless:
+        show_banner()
+
+    mode = "Remote API" if api_url else "Local Model"
+    print_header("🎨 Starting Gradio UI", f"Mode: {mode}")
+
+    try:
+        from pr0loader.api.gradio_ui import launch_gradio
+
+        print_info(f"Web UI: http://{host}:{port}")
+        if api_url:
+            print_info(f"Using API: {api_url}")
+        print_info("Press Ctrl+C to stop")
+        console.print()
+
+        launch_gradio(
+            model_path=model,
+            api_url=api_url,
+            host=host,
+            port=port,
+            share=share,
+        )
+
+    except ImportError:
+        print_error("Gradio not installed. Install with: pip install gradio")
+        raise typer.Exit(1)
+    except Exception as e:
+        print_error(f"Gradio UI failed: {e}")
+        raise typer.Exit(1)
+
+
+@app.command()
+def serve(
+    ctx: typer.Context,
+    host: str = typer.Option("0.0.0.0", "--host", "-h", help="Host to bind to"),
+    api_port: int = typer.Option(8000, "--api-port", help="API server port"),
+    ui_port: int = typer.Option(7860, "--ui-port", help="Gradio UI port"),
+    model: Optional[Path] = typer.Option(None, "--model", "-m", help="Path to trained model"),
+):
+    """🚀 Start both API server and Gradio UI.
+
+    Launches both the inference API and the web UI for testing.
+    """
+    headless = ctx.obj.get("headless", False)
+    if not headless:
+        show_banner()
+
+    print_header("🚀 Starting Full Server", "API + Gradio UI")
+    print_info(f"API Server: http://{host}:{api_port}")
+    print_info(f"Web UI: http://{host}:{ui_port}")
+    print_info("Press Ctrl+C to stop")
+    console.print()
+
+    import threading
+
+    try:
+        import uvicorn
+        from pr0loader.api.server import create_app
+        from pr0loader.api.gradio_ui import launch_gradio
+
+        # Start API server in background thread
+        api_app = create_app(model_path=model)
+
+        def run_api():
+            uvicorn.run(api_app, host=host, port=api_port, log_level="warning")
+
+        api_thread = threading.Thread(target=run_api, daemon=True)
+        api_thread.start()
+
+        print_success("API server started")
+
+        # Start Gradio in main thread (connects to API)
+        api_url = f"http://{host}:{api_port}"
+        launch_gradio(
+            api_url=api_url,
+            host=host,
+            port=ui_port,
+            share=False,
+        )
+
+    except ImportError as e:
+        print_error(f"Missing dependencies: {e}")
+        print_info("Install with: pip install fastapi uvicorn python-multipart gradio")
+        raise typer.Exit(1)
+    except Exception as e:
+        print_error(f"Server failed: {e}")
+        raise typer.Exit(1)
+
+
+@app.command()
+def login(
+    ctx: typer.Context,
+    auto: bool = typer.Option(False, "--auto", "-a", help="Auto-detect from browsers"),
+    browser: Optional[str] = typer.Option(None, "--browser", "-b", help="Extract from specific browser (firefox/chrome/edge/brave)"),
+    interactive: bool = typer.Option(False, "--interactive", "-i", help="Interactive login with captcha"),
+):
+    """🔐 Login to pr0gramm.
+
+    Authentication methods (tried in order):
+    1. --auto: Try to extract cookies from installed browsers
+    2. --browser: Extract from a specific browser
+    3. --interactive: Manual login with captcha
+
+    Without options, shows current auth status and available options.
+    """
+    headless = ctx.obj.get("headless", False)
+    if not headless:
+        show_banner()
+
+    print_header("🔐 Authentication", "Login to pr0gramm")
+
+    try:
+        from pr0loader.auth import get_auth_manager, get_all_extractors
+
+        auth = get_auth_manager()
+
+        # Check current status first
+        status = auth.get_status()
+
+        if status.get("authenticated") or status.get("stored_credentials"):
+            print_success(f"Already logged in as: {status.get('username', 'unknown')}")
+            print_info(f"Verified (NSFW access): {'Yes' if status.get('verified') else 'No'}")
+
+            if not (auto or browser or interactive):
+                print_info("Use --interactive to re-login or 'pr0loader logout' to clear")
+                return
+
+        credentials = None
+
+        # Method 1: Auto-detect from browsers
+        if auto or (not browser and not interactive):
+            print_info("Trying to extract cookies from browsers...")
+
+            # Show available browsers
+            available = status.get("available_browsers", [])
+            if available:
+                print_info(f"Available browsers: {', '.join(available)}")
+            else:
+                print_warning("No supported browsers found")
+
+            credentials = auth.get_credentials(auto_login=True)
+
+        # Method 2: Specific browser
+        if browser and not credentials:
+            print_info(f"Extracting from {browser}...")
+            credentials = auth.extract_from_browser(browser)
+
+        # Method 3: Interactive login
+        if interactive and not credentials:
+            print_info("Starting interactive login...")
+            credentials = auth.login_interactive()
+
+        # Result
+        if credentials:
+            print_success(f"Logged in as: {credentials.username}")
+            print_info(f"User ID: {credentials.user_id}")
+            print_info(f"Verified (NSFW access): {'Yes' if credentials.is_verified else 'No'}")
+            print_success("Credentials saved securely")
+        else:
+            if not (auto or browser or interactive):
+                # No method specified, show help
+                print_info("\nLogin methods:")
+                print_info("  pr0loader login --auto         Extract from any browser")
+                print_info("  pr0loader login --browser firefox")
+                print_info("  pr0loader login --interactive  Manual login with captcha")
+            else:
+                print_error("Login failed")
+                raise typer.Exit(1)
+
+    except ImportError as e:
+        print_error(f"Missing dependencies: {e}")
+        print_info("Some features may require: pip install pycryptodome keyring pillow")
+        raise typer.Exit(1)
+    except Exception as e:
+        print_error(f"Login failed: {e}")
+        raise typer.Exit(1)
+
+
+@app.command()
+def logout(ctx: typer.Context):
+    """🚪 Logout and clear stored credentials."""
+    headless = ctx.obj.get("headless", False)
+    if not headless:
+        show_banner()
+
+    try:
+        from pr0loader.auth import get_auth_manager
+
+        auth = get_auth_manager()
+
+        if auth.logout():
+            print_success("Logged out successfully")
+            print_info("Stored credentials have been cleared")
+        else:
+            print_warning("No credentials to clear")
+
+    except Exception as e:
+        print_error(f"Logout failed: {e}")
+        raise typer.Exit(1)
+
+
+@app.command("auth-status")
+def auth_status(ctx: typer.Context):
+    """📋 Show current authentication status."""
+    headless = ctx.obj.get("headless", False)
+    if not headless:
+        show_banner()
+
+    try:
+        from pr0loader.auth import get_auth_manager
+
+        auth = get_auth_manager()
+        status = auth.get_status()
+
+        # Create status table
+        table = Table(title="Authentication Status", box=box.ROUNDED)
+        table.add_column("Property", style="cyan")
+        table.add_column("Value", style="green")
+
+        # Credential status
+        if status.get("stored_credentials"):
+            table.add_row("Status", "✓ Logged in")
+            table.add_row("Username", status.get("username", "unknown"))
+            table.add_row("User ID", str(status.get("user_id", "unknown")))
+            table.add_row("NSFW Access", "✓ Yes" if status.get("verified") else "✗ No (not verified)")
+        else:
+            table.add_row("Status", "✗ Not logged in")
+
+        # Available browsers
+        browsers = status.get("available_browsers", [])
+        if browsers:
+            table.add_row("Available Browsers", ", ".join(browsers))
+        else:
+            table.add_row("Available Browsers", "None detected")
+
+        console.print(table)
+
+        if not status.get("stored_credentials"):
+            console.print()
+            print_info("Login with: pr0loader login --auto")
+
+    except Exception as e:
+        print_error(f"Error: {e}")
         raise typer.Exit(1)
 
 

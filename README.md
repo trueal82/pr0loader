@@ -29,16 +29,117 @@ pip install -e ".[ml]"
 
 ## ⚙️ Configuration
 
-Copy `template.env` to `.env` and configure your settings:
+### First-Time Setup
+
+Run pr0loader without arguments to start the **setup wizard**:
 
 ```bash
-cp template.env .env
+pr0loader
 ```
 
-Required settings:
-- `PP` - Your pr0gramm PP cookie
-- `ME` - Your pr0gramm ME cookie
-- `FILESYSTEM_PREFIX` - Directory to store downloaded media
+The wizard will guide you through:
+1. **Data directory** - Where to store all pr0loader files
+2. **Authentication** - Auto-login from browser or enter cookies manually
+3. **Content preferences** - Which content types to download (SFW, NSFW, etc.)
+4. **Advanced settings** - Training parameters (optional)
+
+You can also run the setup explicitly:
+
+```bash
+pr0loader setup          # Run setup wizard
+pr0loader setup --force  # Overwrite existing configuration
+```
+
+### Data Directory
+
+All pr0loader data is stored under a single base directory:
+
+| OS | Default Location |
+|----|------------------|
+| Windows | `%LOCALAPPDATA%\pr0loader` |
+| Linux | `~/.local/share/pr0loader` |
+| macOS | `~/.local/share/pr0loader` |
+
+You can override this in `.env`:
+
+```bash
+DATA_DIR = ~/my-pr0loader-data
+```
+
+### Directory Structure
+
+```
+{DATA_DIR}/
+├── pr0loader.db      # SQLite database (metadata, tags)
+├── media/            # Downloaded images/videos
+├── output/           # Generated datasets
+├── models/           # Trained models
+├── checkpoints/      # Training checkpoints
+└── auth/             # Credentials (if not using keyring)
+```
+
+All paths can be individually overridden in `.env` if needed.
+
+**Authentication is now handled automatically!** See the Authentication section below.
+
+## 🔐 Authentication
+
+pr0loader now supports automatic authentication - no more manual cookie extraction!
+
+### Quick Start
+
+```bash
+# Auto-detect from installed browsers (recommended)
+pr0loader login --auto
+
+# Or extract from a specific browser
+pr0loader login --browser firefox
+pr0loader login --browser chrome
+
+# Or interactive login with captcha
+pr0loader login --interactive
+
+# Check current status
+pr0loader auth-status
+
+# Logout / clear credentials
+pr0loader logout
+```
+
+### Authentication Methods
+
+| Method | Command | Description |
+|--------|---------|-------------|
+| Auto-detect | `--auto` | Tries all installed browsers |
+| Firefox | `--browser firefox` | Extract from Firefox (easiest) |
+| Chrome | `--browser chrome` | Extract from Chrome (needs DPAPI) |
+| Edge | `--browser edge` | Extract from Edge |
+| Brave | `--browser brave` | Extract from Brave |
+| Interactive | `--interactive` | Login with username/password + captcha |
+
+### How It Works
+
+1. **Browser extraction**: Reads cookies from your browser's database
+   - Firefox: Unencrypted SQLite, easiest method
+   - Chrome/Edge: Encrypted with Windows DPAPI, requires `pycryptodome`
+
+2. **Interactive login**: 
+   - Fetches captcha from pr0gramm
+   - Displays captcha (saved as temp file + ASCII preview)
+   - You enter username, password, and captcha solution
+   - Credentials stored securely in system keyring
+
+3. **Secure storage**: Credentials are stored using:
+   - System keyring (Windows Credential Manager, macOS Keychain, etc.)
+   - Falls back to encrypted file if keyring unavailable
+
+### Install Auth Dependencies
+
+```bash
+pip install pr0loader[auth]
+# or
+pip install keyring pycryptodome pillow
+```
 
 ## 📖 Usage
 
@@ -170,6 +271,72 @@ pr0loader predict image.jpg --json
 
 # Custom model
 pr0loader predict image.jpg --model ./my_model.keras
+```
+
+### 6. Inference API Server
+
+Start a REST API for tag prediction:
+
+```bash
+# Start API server on default port 8000
+pr0loader api
+
+# Custom host and port
+pr0loader api --host 0.0.0.0 --port 8080
+
+# With custom model
+pr0loader api --model ./my_model.keras
+```
+
+#### API Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/` | Health check |
+| GET | `/health` | Health check |
+| GET | `/docs` | Interactive API documentation (Swagger) |
+| POST | `/predict` | Predict tags for single image |
+| POST | `/predict/batch` | Predict tags for multiple images |
+
+#### API Usage Examples
+
+```bash
+# Single image prediction
+curl -X POST "http://localhost:8000/predict" \
+    -F "file=@image.jpg" \
+    -F "top_k=5"
+
+# Batch prediction
+curl -X POST "http://localhost:8000/predict/batch" \
+    -F "files=@image1.jpg" \
+    -F "files=@image2.jpg"
+```
+
+### 7. Gradio Web UI
+
+Launch an interactive web interface for testing:
+
+```bash
+# Start Gradio UI (uses local model)
+pr0loader ui
+
+# Connect to remote API server
+pr0loader ui --api-url http://localhost:8000
+
+# Create public shareable link
+pr0loader ui --share
+```
+
+### 8. Combined Server (API + UI)
+
+Start both the API server and Gradio UI together:
+
+```bash
+# Start both servers
+pr0loader serve
+
+# Custom ports
+pr0loader serve --api-port 8000 --ui-port 7860
 ```
 
 ## 🖥️ Headless Mode
