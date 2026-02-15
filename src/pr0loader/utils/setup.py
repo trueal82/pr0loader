@@ -281,6 +281,19 @@ class SetupWizard:
         except ValueError:
             advanced["MIN_VALID_TAGS"] = 5
 
+        # Database batch size
+        self.console.print()
+        self.console.print("[dim]Database batch size: number of items to batch before committing.[/dim]")
+        self.console.print("[dim]Higher values = faster (especially on HDDs), but use more RAM.[/dim]")
+        db_batch = Prompt.ask(
+            "Database batch size",
+            default=self._get_default("DB_BATCH_SIZE", "200")
+        )
+        try:
+            advanced["DB_BATCH_SIZE"] = int(db_batch)
+        except ValueError:
+            advanced["DB_BATCH_SIZE"] = 200
+
         self.config.update(advanced)
         return advanced
 
@@ -344,6 +357,14 @@ class SetupWizard:
             f"BATCH_SIZE = {self.config.get('BATCH_SIZE', 128)}",
             f"NUM_EPOCHS = {self.config.get('NUM_EPOCHS', 5)}",
             f"MIN_VALID_TAGS = {self.config.get('MIN_VALID_TAGS', 5)}",
+            "",
+        ])
+
+        # Performance settings
+        lines.extend([
+            "# ===========================================",
+            "# PERFORMANCE SETTINGS",
+            f"DB_BATCH_SIZE = {self.config.get('DB_BATCH_SIZE', 200)}  # Items to batch before DB commit (higher = faster)",
             "",
         ])
 

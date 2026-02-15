@@ -172,8 +172,31 @@ class ArrowKeyMenu:
         self.items = items
         self.title = title
         self.console = console or Console()
-        self.selected_index = 0
         self.status_info = status_info or {}
+
+        # Find first selectable item (non-separator)
+        self.selected_index = 0
+        for i, (key, _, _, _) in enumerate(items):
+            if key:  # Non-empty key means selectable
+                self.selected_index = i
+                break
+
+    def _is_separator(self, index: int) -> bool:
+        """Check if an item at index is a separator (empty key)."""
+        return not self.items[index][0]
+
+    def _find_next_selectable(self, current: int, direction: int) -> int:
+        """Find the next selectable item in the given direction."""
+        n = len(self.items)
+        next_idx = (current + direction) % n
+
+        # Loop until we find a selectable item or return to start
+        attempts = 0
+        while self._is_separator(next_idx) and attempts < n:
+            next_idx = (next_idx + direction) % n
+            attempts += 1
+
+        return next_idx
 
     def _render_status_panel(self) -> Panel:
         """Render the status info panel."""
@@ -254,11 +277,17 @@ class ArrowKeyMenu:
         # Menu table
         table = Table(box=box.ROUNDED, show_header=False, padding=(0, 2))
         table.add_column("", width=2)  # Selection indicator
-        table.add_column("Key", style="bold cyan", width=4)
-        table.add_column("Action", width=20)
+        table.add_column("Key", style="bold cyan", width=6)
+        table.add_column("Action", width=22)
         table.add_column("Description")
 
-        for i, (key, _, name, desc) in enumerate(self.items):
+        for i, (key, action, name, desc) in enumerate(self.items):
+            # Check if this is a separator
+            if not key:
+                # Render separator row
+                table.add_row("", "", Text(name, style="dim"), "")
+                continue
+
             if i == self.selected_index:
                 # Highlighted row
                 indicator = "▶"
@@ -271,9 +300,12 @@ class ArrowKeyMenu:
                 name_style = "bold"
                 desc_style = "dim"
 
+            # Show arrow for submenu items
+            display_key = f"[{key}]" if key != "!" else "[!]"
+
             table.add_row(
                 Text(indicator, style="bold cyan"),
-                Text(f"[{key}]", style=key_style),
+                Text(display_key, style=key_style),
                 Text(name, style=name_style),
                 Text(desc, style=desc_style),
             )
@@ -314,25 +346,46 @@ class ArrowKeyMenu:
                 should_exit = False
 
                 if key == 'UP':
-                    self.selected_index = (self.selected_index - 1) % len(self.items)
+                    self.selected_index = self._find_next_selectable(self.selected_index, -1)
                     live.update(self._render_menu())
                 elif key == 'DOWN':
-                    self.selected_index = (self.selected_index + 1) % len(self.items)
+                    self.selected_index = self._find_next_selectable(self.selected_index, 1)
                     live.update(self._render_menu())
                 elif key == 'ENTER':
                     # Exit live context and return
                     should_exit = True
-                elif key == 'ESC' or key == 'q':
-                    # Find quit action
+                elif key == 'ESC':
+                    # Find back or quit action
                     for i, (_, action, _, _) in enumerate(self.items):
-                        if action == "quit":
+                        if action in ("back", "quit"):
                             self.selected_index = i
                             break
                     should_exit = True
+                elif key == 'q':
+                    # Find quit action specifically
+                    for i, (_, action, _, _) in enumerate(self.items):
+                        if action == "quit":
+                            self.selected_index = i
+                            should_exit = True
+                            break
+                    # If no quit, try back
+                    if not should_exit:
+                        for i, (_, action, _, _) in enumerate(self.items):
+                            if action == "back":
+                                self.selected_index = i
+                                should_exit = True
+                                break
+                elif key == 'b':
+                    # Find back action
+                    for i, (_, action, _, _) in enumerate(self.items):
+                        if action == "back":
+                            self.selected_index = i
+                            should_exit = True
+                            break
                 elif key:  # Non-empty key
                     # Check if key matches a shortcut
                     for i, (shortcut, action, _, _) in enumerate(self.items):
-                        if key == shortcut.lower():
+                        if shortcut and key == shortcut.lower():
                             self.selected_index = i
                             should_exit = True
                             break
@@ -356,6 +409,9 @@ class InteractiveMenu:
 
     def show_header(self):
         """Show the menu header."""
+        from pr0loader.utils.ui import clear_screen
+        clear_screen()
+
         header = """
 [bold magenta]              ___  _                 _           
  _ __  _ __  / _ \\| | ___   __ _  __| | ___ _ __ 
@@ -442,22 +498,36 @@ class InteractiveMenu:
     def show_main_menu(self) -> Optional[str]:
         """Show the main menu and return selected action."""
 
+        # Hierarchical menu structure
         menu_items = [
-            ("1", "sync", "🔄 Sync", "Fetch metadata and download assets"),
-            ("2", "fetch", "📥 Fetch", "Fetch metadata only"),
-            ("3", "download", "📁 Download", "Download media files"),
-            ("4", "prepare", "📊 Prepare", "Prepare dataset for training"),
-            ("5", "train", "🧠 Train", "Train tag prediction model"),
-            ("6", "predict", "🔮 Predict", "Predict tags for images"),
-            ("7", "api", "🌐 API", "Start inference API server"),
-            ("8", "ui", "🎨 UI", "Start Gradio web interface"),
-            ("9", "serve", "🚀 Serve", "Start both API and UI"),
-            ("l", "login", "🔐 Login", "Login to pr0gramm"),
-            ("o", "logout", "🚪 Logout", "Clear stored credentials"),
-            ("s", "setup", "⚙️ Setup", "Reconfigure pr0loader"),
-            ("i", "info", "📊 Info", "Show system information"),
+            # Big red button - automated workflow
+            ("!", "auto_pipeline", "🚀 AUTO: Full Pipeline", "Dev mode: fetch→prepare→train→validate"),
+            ("", "", "─" * 40, ""),  # Separator
+
+            # Data Ingestion
+            ("1", "menu_ingest", "📥 Data Ingestion", "Fetch & download from pr0gramm →"),
+
+            # Data Preparation
+            ("2", "menu_prepare", "📊 Data Preparation", "Prepare datasets for training →"),
+
+            # Model Training & Validation
+            ("3", "menu_training", "🧠 Training & Validation", "Train and evaluate models →"),
+
+            # Inference / Production
+            ("4", "menu_inference", "🔮 Inference Mode", "Run predictions & serve API →"),
+
+            ("", "", "─" * 40, ""),  # Separator
+
+            # Settings & Config
+            ("s", "menu_settings", "⚙️ Settings", "Configure pr0loader →"),
+
+            # Quick actions
+            ("i", "info", "📊 System Info", "Show status and statistics"),
             ("q", "quit", "❌ Quit", "Exit pr0loader"),
         ]
+
+        # Filter out separators for key handling
+        valid_items = [(k, a, n, d) for k, a, n, d in menu_items if k]
 
         # Gather status info
         status_info = self._gather_status_info()
@@ -466,14 +536,94 @@ class InteractiveMenu:
         if not self.caps["is_dumb"]:
             menu = ArrowKeyMenu(
                 items=menu_items,
-                title="Main Menu",
+                title="pr0loader - Main Menu",
                 console=self.console,
                 status_info=status_info,
             )
             return menu.run()
         else:
             # Fallback to simple prompt-based menu
-            return self._show_simple_menu(menu_items)
+            return self._show_simple_menu(valid_items)
+
+    def show_submenu(self, submenu_type: str) -> Optional[str]:
+        """Show a submenu based on type and return selected action."""
+        from pr0loader.utils.ui import clear_screen
+        clear_screen()
+
+        if submenu_type == "menu_ingest":
+            menu_items = [
+                ("1", "sync", "🔄 Full Sync", "Fetch metadata + download assets"),
+                ("2", "fetch", "📥 Fetch Metadata", "Download metadata only"),
+                ("3", "download", "📁 Download Assets", "Download media files"),
+                ("", "", "─" * 35, ""),
+                ("l", "login", "🔐 Login", "Authenticate with pr0gramm"),
+                ("o", "logout", "🚪 Logout", "Clear credentials"),
+                ("", "", "─" * 35, ""),
+                ("b", "back", "← Back", "Return to main menu"),
+            ]
+            title = "Data Ingestion"
+
+        elif submenu_type == "menu_prepare":
+            menu_items = [
+                ("1", "prepare", "📊 Prepare Dataset", "Generate training CSV"),
+                ("2", "prepare_split", "✂️ Split Dataset", "Create train/val/test split"),
+                ("3", "prepare_stats", "📈 Dataset Stats", "Show dataset statistics"),
+                ("", "", "─" * 35, ""),
+                ("b", "back", "← Back", "Return to main menu"),
+            ]
+            title = "Data Preparation"
+
+        elif submenu_type == "menu_training":
+            menu_items = [
+                ("1", "train", "🧠 Train Model", "Train tag prediction model"),
+                ("2", "validate", "✅ Validate Model", "Evaluate on test set"),
+                ("3", "train_resume", "▶️ Resume Training", "Continue from checkpoint"),
+                ("", "", "─" * 35, ""),
+                ("b", "back", "← Back", "Return to main menu"),
+            ]
+            title = "Training & Validation"
+
+        elif submenu_type == "menu_inference":
+            menu_items = [
+                ("1", "predict", "🔮 Predict Tags", "Predict tags for images"),
+                ("2", "api", "🌐 Start API", "Launch inference API server"),
+                ("3", "ui", "🎨 Start UI", "Launch Gradio web interface"),
+                ("4", "serve", "🚀 Serve Both", "Start API + UI together"),
+                ("", "", "─" * 35, ""),
+                ("b", "back", "← Back", "Return to main menu"),
+            ]
+            title = "Inference Mode"
+
+        elif submenu_type == "menu_settings":
+            menu_items = [
+                ("1", "settings_dev", "🧪 Dev Mode", "Toggle development mode (1k images)"),
+                ("2", "settings_flags", "🎭 Content Flags", "Configure SFW/NSFW/NSFL/POL"),
+                ("3", "settings_performance", "⚡ Performance", "Database batch size & caching"),
+                ("4", "setup", "⚙️ Full Setup", "Run setup wizard"),
+                ("5", "init", "🏗️ Init Dirs", "Create data directories"),
+                ("", "", "─" * 35, ""),
+                ("b", "back", "← Back", "Return to main menu"),
+            ]
+            title = "Settings"
+        else:
+            return "back"
+
+        # Filter out separators for key handling
+        valid_items = [(k, a, n, d) for k, a, n, d in menu_items if k]
+
+        # Gather status info
+        status_info = self._gather_status_info()
+
+        if not self.caps["is_dumb"]:
+            menu = ArrowKeyMenu(
+                items=menu_items,
+                title=title,
+                console=self.console,
+                status_info=status_info,
+            )
+            return menu.run()
+        else:
+            return self._show_simple_menu(valid_items)
 
     def _show_simple_menu(self, menu_items: List[Tuple[str, str, str, str]]) -> Optional[str]:
         """Fallback simple menu for dumb terminals."""
@@ -501,271 +651,288 @@ class InteractiveMenu:
 
     def configure_sync(self) -> dict:
         """Configure sync options interactively."""
-        self.console.print("\n[bold]Configure Sync Options[/bold]\n")
+        from pr0loader.utils.ui import DialogBuilder
 
-        options = {}
+        dialog = DialogBuilder("🔄 Sync Configuration", "Configure metadata fetch and asset download")
+        dialog.add_info("Sync will fetch metadata and download media files.")
+        dialog.add_separator()
+        dialog.add_confirm("full", "Full sync (re-fetch all metadata)?", default=False,
+                          description="Warning: This will re-download all metadata from the beginning")
+        dialog.add_confirm("include_videos", "Include videos?", default=False,
+                          description="By default, only images are downloaded")
+        dialog.add_confirm("verify", "Verify existing files?", default=True,
+                          description="Use HEAD requests to check if local files match remote")
+        dialog.add_confirm("metadata_only", "Metadata only (skip downloads)?", default=False)
 
-        # Full sync?
-        options["full"] = Confirm.ask(
-            "Perform full sync (re-fetch all metadata)?",
-            default=False
-        )
+        result = dialog.run()
+        if result is None:
+            return {"cancelled": True}
 
-        # Start from specific ID?
-        if not options["full"]:
-            if Confirm.ask("Start from a specific ID?", default=False):
-                options["start_from"] = IntPrompt.ask("Enter starting ID")
+        # Handle start_from separately if not full sync
+        if not result.get("full"):
+            from pr0loader.utils.ui import clear_screen, console
+            if Confirm.ask("\nStart from a specific ID?", default=False):
+                result["start_from"] = IntPrompt.ask("Enter starting ID")
             else:
-                options["start_from"] = None
+                result["start_from"] = None
         else:
-            options["start_from"] = None
+            result["start_from"] = None
 
-        # Include videos?
-        options["include_videos"] = Confirm.ask(
-            "Include videos? (default: images only)",
-            default=False
-        )
+        return result
 
-        # Verify existing files?
-        options["verify"] = Confirm.ask(
-            "Verify existing files with HEAD request?",
-            default=True
-        )
-
-        # Metadata only?
-        options["metadata_only"] = Confirm.ask(
-            "Metadata only (skip downloads)?",
-            default=False
-        )
-
-        # Show summary
-        self._show_options_summary("Sync", options)
-
-        if not Confirm.ask("\nProceed with these options?", default=True):
-            return self.configure_sync()
-
-        return options
 
     def configure_download(self) -> dict:
         """Configure download options interactively."""
-        self.console.print("\n[bold]Configure Download Options[/bold]\n")
+        from pr0loader.utils.ui import DialogBuilder
 
-        options = {}
+        dialog = DialogBuilder("📁 Download Configuration", "Configure media file downloads")
+        dialog.add_info("Download media files from pr0gramm based on stored metadata.")
+        dialog.add_separator()
+        dialog.add_confirm("include_videos", "Include videos?", default=False,
+                          description="By default, only images (jpg, png, gif) are downloaded")
 
-        options["include_videos"] = Confirm.ask(
-            "Include videos? (default: images only)",
-            default=False
-        )
-
-        self._show_options_summary("Download", options)
-
-        if not Confirm.ask("\nProceed with these options?", default=True):
-            return self.configure_download()
-
-        return options
+        result = dialog.run()
+        return result if result else {"cancelled": True}
 
     def configure_fetch(self) -> dict:
         """Configure fetch options interactively."""
-        self.console.print("\n[bold]Configure Fetch Options[/bold]\n")
+        from pr0loader.utils.ui import DialogBuilder
 
-        options = {}
+        dialog = DialogBuilder("📥 Fetch Configuration", "Configure metadata fetching from pr0gramm API")
+        dialog.add_info("Fetch will download metadata (tags, scores, etc.) without media files.")
+        dialog.add_separator()
+        dialog.add_confirm("full", "Full update (re-fetch all)?", default=False,
+                          description="Warning: This will start from the beginning")
 
-        options["full"] = Confirm.ask(
-            "Perform full update (re-fetch all)?",
-            default=False
-        )
+        result = dialog.run()
+        if result is None:
+            return {"cancelled": True}
 
-        if not options["full"]:
-            if Confirm.ask("Start from a specific ID?", default=False):
-                options["start_from"] = IntPrompt.ask("Enter starting ID")
+        # Handle start_from separately if not full
+        if not result.get("full"):
+            if Confirm.ask("\nStart from a specific ID?", default=False):
+                result["start_from"] = IntPrompt.ask("Enter starting ID")
             else:
-                options["start_from"] = None
+                result["start_from"] = None
         else:
-            options["start_from"] = None
+            result["start_from"] = None
 
-        self._show_options_summary("Fetch", options)
-
-        if not Confirm.ask("\nProceed with these options?", default=True):
-            return self.configure_fetch()
-
-        return options
+        return result
 
     def configure_prepare(self) -> dict:
         """Configure prepare options interactively."""
-        self.console.print("\n[bold]Configure Prepare Options[/bold]\n")
+        from pr0loader.utils.ui import DialogBuilder
 
-        options = {}
+        dialog = DialogBuilder("📊 Prepare Configuration", "Configure dataset preparation")
+        dialog.add_info("Prepare will generate a training-ready CSV from the database.")
+        dialog.add_separator()
+        dialog.add_number("min_tags", "Minimum valid tags per item", default=5,
+                         description="Items with fewer tags will be excluded", min_value=1)
+        dialog.add_text("output", "Custom output file (leave empty for default)", default="")
 
-        options["min_tags"] = IntPrompt.ask(
-            "Minimum valid tags per item",
-            default=5
-        )
+        result = dialog.run()
+        if result is None:
+            return {"cancelled": True}
 
-        if Confirm.ask("Specify custom output file?", default=False):
-            options["output"] = Prompt.ask("Output file path")
-        else:
-            options["output"] = None
+        # Convert empty string to None
+        if not result.get("output"):
+            result["output"] = None
 
-        self._show_options_summary("Prepare", options)
-
-        if not Confirm.ask("\nProceed with these options?", default=True):
-            return self.configure_prepare()
-
-        return options
+        return result
 
     def configure_train(self) -> dict:
         """Configure train options interactively."""
-        self.console.print("\n[bold]Configure Train Options[/bold]\n")
+        from pr0loader.utils.ui import DialogBuilder
 
-        options = {}
+        from pr0loader.utils.ui import DialogBuilder, clear_screen, console as ui_console
+
+        clear_screen()
+        ui_console.print(Panel(
+            "[bold cyan]🧠 Train Configuration[/bold cyan]\n[dim]Configure model training parameters[/dim]",
+            box=box.DOUBLE, border_style="blue"
+        ))
+        ui_console.print()
 
         # Find available datasets
         from pr0loader.config import load_settings
         settings = load_settings()
         datasets = sorted(settings.output_dir.glob("*_dataset.csv"), reverse=True)
 
-        if datasets:
-            self.console.print("[dim]Available datasets:[/dim]")
-            for i, ds in enumerate(datasets[:5], 1):
-                self.console.print(f"  {i}. {ds.name}")
+        options = {}
 
-            if Confirm.ask("\nUse most recent dataset?", default=True):
+        if datasets:
+            ui_console.print("[cyan]Available datasets:[/cyan]")
+            for i, ds in enumerate(datasets[:5], 1):
+                ui_console.print(f"  {i}. {ds.name}")
+            ui_console.print()
+
+            if Confirm.ask("Use most recent dataset?", default=True):
                 options["dataset"] = str(datasets[0])
             else:
                 options["dataset"] = Prompt.ask("Enter dataset path")
         else:
             options["dataset"] = Prompt.ask("Enter dataset path")
 
-        options["epochs"] = IntPrompt.ask("Number of epochs", default=5)
-        options["batch_size"] = IntPrompt.ask("Batch size", default=128)
-        options["dev_mode"] = Confirm.ask("Development mode (use subset)?", default=False)
+        ui_console.print()
+        options["epochs"] = IntPrompt.ask("[cyan]Number of epochs[/cyan]", default=5)
+        options["batch_size"] = IntPrompt.ask("[cyan]Batch size[/cyan]", default=128)
+        options["dev_mode"] = Confirm.ask("[cyan]Development mode (use subset)?[/cyan]", default=False)
 
-        if Confirm.ask("Specify custom output model path?", default=False):
+        if Confirm.ask("[cyan]Specify custom output model path?[/cyan]", default=False):
             options["output"] = Prompt.ask("Output model path")
         else:
             options["output"] = None
 
-        self._show_options_summary("Train", options)
+        # Show summary
+        ui_console.print()
+        table = Table(title="Training Configuration", box=box.ROUNDED)
+        table.add_column("Setting", style="cyan")
+        table.add_column("Value", style="green")
+        for k, v in options.items():
+            table.add_row(k.replace("_", " ").title(), str(v) if v else "[dim]default[/dim]")
+        ui_console.print(table)
 
-        if not Confirm.ask("\nProceed with these options?", default=True):
-            return self.configure_train()
+        if not Confirm.ask("\n[bold]Proceed with training?[/bold]", default=True):
+            return {"cancelled": True}
 
         return options
 
     def configure_predict(self) -> dict:
         """Configure predict options interactively."""
-        self.console.print("\n[bold]Configure Predict Options[/bold]\n")
+        from pr0loader.utils.ui import DialogBuilder, clear_screen, console as ui_console
+
+        clear_screen()
+        ui_console.print(Panel(
+            "[bold cyan]🔮 Predict Configuration[/bold cyan]\n[dim]Configure tag prediction[/dim]",
+            box=box.DOUBLE, border_style="blue"
+        ))
+        ui_console.print()
 
         options = {}
 
         # Get image paths
         image_paths = []
+        ui_console.print("[cyan]Enter image paths (type 'done' when finished):[/cyan]")
         while True:
-            path = Prompt.ask("Enter image path (or 'done' to finish)")
+            path = Prompt.ask("  Image path", default="done")
             if path.lower() == 'done':
                 break
             if Path(path).exists():
                 image_paths.append(path)
-                self.console.print(f"  [green]✓[/green] Added: {path}")
+                ui_console.print(f"    [green]✓[/green] Added: {path}")
             else:
-                self.console.print(f"  [red]✗[/red] File not found: {path}")
+                ui_console.print(f"    [red]✗[/red] File not found: {path}")
 
         if not image_paths:
-            self.console.print("[red]No images specified![/red]")
-            return self.configure_predict()
+            ui_console.print("[red]No images specified![/red]")
+            return {"cancelled": True}
 
         options["images"] = image_paths
-        options["top_k"] = IntPrompt.ask("Number of top tags to show", default=5)
-        options["json_output"] = Confirm.ask("Output as JSON?", default=False)
+        ui_console.print()
+        options["top_k"] = IntPrompt.ask("[cyan]Number of top tags to show[/cyan]", default=5)
+        options["json_output"] = Confirm.ask("[cyan]Output as JSON?[/cyan]", default=False)
 
-        if Confirm.ask("Use custom model?", default=False):
+        if Confirm.ask("[cyan]Use custom model?[/cyan]", default=False):
             options["model"] = Prompt.ask("Model path")
         else:
             options["model"] = None
 
-        self._show_options_summary("Predict", options)
-
-        if not Confirm.ask("\nProceed with these options?", default=True):
-            return self.configure_predict()
+        if not Confirm.ask("\n[bold]Run prediction?[/bold]", default=True):
+            return {"cancelled": True}
 
         return options
 
     def configure_api(self) -> dict:
         """Configure API server options interactively."""
-        self.console.print("\n[bold]Configure API Server Options[/bold]\n")
+        from pr0loader.utils.ui import DialogBuilder
 
-        options = {}
+        dialog = DialogBuilder("🌐 API Server Configuration", "Configure the inference API server")
+        dialog.add_info("The API server provides REST endpoints for tag prediction.")
+        dialog.add_separator()
+        dialog.add_text("host", "Host to bind to", default="0.0.0.0",
+                       description="Use 0.0.0.0 for all interfaces, 127.0.0.1 for localhost only")
+        dialog.add_number("port", "Port number", default=8000)
+        dialog.add_text("model", "Custom model path (leave empty for default)", default="")
 
-        options["host"] = Prompt.ask("Host to bind to", default="0.0.0.0")
-        options["port"] = IntPrompt.ask("Port", default=8000)
+        result = dialog.run()
+        if result is None:
+            return {"cancelled": True}
 
-        if Confirm.ask("Use custom model path?", default=False):
-            options["model"] = Prompt.ask("Model path")
-        else:
-            options["model"] = None
+        if not result.get("model"):
+            result["model"] = None
 
-        self._show_options_summary("API Server", options)
+        return result
 
-        if not Confirm.ask("\nProceed with these options?", default=True):
-            return self.configure_api()
 
         return options
 
     def configure_ui(self) -> dict:
         """Configure Gradio UI options interactively."""
-        self.console.print("\n[bold]Configure Gradio UI Options[/bold]\n")
+        from pr0loader.utils.ui import DialogBuilder, clear_screen, console as ui_console
+
+        clear_screen()
+        ui_console.print(Panel(
+            "[bold cyan]🎨 Gradio UI Configuration[/bold cyan]\n[dim]Configure the web interface[/dim]",
+            box=box.DOUBLE, border_style="blue"
+        ))
+        ui_console.print()
 
         options = {}
 
         # Mode selection
-        use_api = Confirm.ask("Connect to remote API server? (No = use local model)", default=False)
+        use_api = Confirm.ask("[cyan]Connect to remote API server?[/cyan]", default=False)
 
         if use_api:
-            options["api_url"] = Prompt.ask("API server URL", default="http://localhost:8000")
+            options["api_url"] = Prompt.ask("[cyan]API server URL[/cyan]", default="http://localhost:8000")
             options["model"] = None
         else:
             options["api_url"] = None
-            if Confirm.ask("Use custom model path?", default=False):
+            if Confirm.ask("[cyan]Use custom model path?[/cyan]", default=False):
                 options["model"] = Prompt.ask("Model path")
             else:
                 options["model"] = None
 
-        options["host"] = Prompt.ask("Host to bind to", default="0.0.0.0")
-        options["port"] = IntPrompt.ask("Port", default=7860)
-        options["share"] = Confirm.ask("Create public Gradio link?", default=False)
+        ui_console.print()
+        options["host"] = Prompt.ask("[cyan]Host to bind to[/cyan]", default="0.0.0.0")
+        options["port"] = IntPrompt.ask("[cyan]Port[/cyan]", default=7860)
+        options["share"] = Confirm.ask("[cyan]Create public Gradio link?[/cyan]", default=False)
 
-        self._show_options_summary("Gradio UI", options)
-
-        if not Confirm.ask("\nProceed with these options?", default=True):
-            return self.configure_ui()
+        if not Confirm.ask("\n[bold]Start Gradio UI?[/bold]", default=True):
+            return {"cancelled": True}
 
         return options
 
     def configure_serve(self) -> dict:
         """Configure combined server options interactively."""
-        self.console.print("\n[bold]Configure Full Server Options[/bold]\n")
+        from pr0loader.utils.ui import DialogBuilder
 
-        options = {}
+        dialog = DialogBuilder("🚀 Full Server Configuration", "Configure API + Gradio UI together")
+        dialog.add_info("This will start both the inference API and Gradio web interface.")
+        dialog.add_separator()
+        dialog.add_text("host", "Host to bind to", default="0.0.0.0")
+        dialog.add_number("api_port", "API server port", default=8000)
+        dialog.add_number("ui_port", "Gradio UI port", default=7860)
+        dialog.add_text("model", "Custom model path (leave empty for default)", default="")
 
-        options["host"] = Prompt.ask("Host to bind to", default="0.0.0.0")
-        options["api_port"] = IntPrompt.ask("API server port", default=8000)
-        options["ui_port"] = IntPrompt.ask("Gradio UI port", default=7860)
+        result = dialog.run()
+        if result is None:
+            return {"cancelled": True}
 
-        if Confirm.ask("Use custom model path?", default=False):
-            options["model"] = Prompt.ask("Model path")
-        else:
-            options["model"] = None
+        if not result.get("model"):
+            result["model"] = None
 
-        self._show_options_summary("Full Server", options)
-
-        if not Confirm.ask("\nProceed with these options?", default=True):
-            return self.configure_serve()
-
-        return options
+        return result
 
     def configure_login(self) -> dict:
         """Configure login options interactively."""
-        self.console.print("\n[bold]Configure Login Options[/bold]\n")
+        from pr0loader.utils.ui import clear_screen, console as ui_console
+
+        clear_screen()
+        ui_console.print(Panel(
+            "[bold cyan]🔐 Login Configuration[/bold cyan]\n[dim]Authenticate with pr0gramm[/dim]",
+            box=box.DOUBLE, border_style="blue"
+        ))
+        ui_console.print()
 
         options = {}
 
@@ -776,17 +943,22 @@ class InteractiveMenu:
             status = auth.get_status()
 
             if status.get("stored_credentials"):
-                self.console.print(f"[green]Currently logged in as: {status.get('username')}[/green]\n")
+                ui_console.print(f"[green]✓ Currently logged in as: {status.get('username')}[/green]\n")
 
             browsers = status.get("available_browsers", [])
             if browsers:
-                self.console.print(f"[dim]Available browsers: {', '.join(browsers)}[/dim]\n")
+                ui_console.print(f"[dim]Available browsers: {', '.join(browsers)}[/dim]\n")
         except:
             pass
 
-        self.console.print("[dim]Select login method:[/dim]")
+        ui_console.print("[cyan]Login methods:[/cyan]")
+        ui_console.print("  • [bold]auto[/bold] - Try to extract cookies from all browsers")
+        ui_console.print("  • [bold]browser[/bold] - Extract from specific browser")
+        ui_console.print("  • [bold]interactive[/bold] - Manual login with username/password")
+        ui_console.print()
+
         method = Prompt.ask(
-            "Method",
+            "[cyan]Select method[/cyan]",
             choices=["auto", "browser", "interactive"],
             default="auto"
         )
@@ -795,7 +967,7 @@ class InteractiveMenu:
 
         if method == "browser":
             browser = Prompt.ask(
-                "Which browser",
+                "[cyan]Which browser[/cyan]",
                 choices=["firefox", "chrome", "edge", "brave"],
                 default="firefox"
             )
@@ -837,6 +1009,251 @@ class InteractiveMenu:
 
         return options
 
+    def configure_auto_pipeline(self) -> dict:
+        """Configure the automatic pipeline (big red button)."""
+        from pr0loader.utils.ui import clear_screen, console as ui_console, ActionConfirm
+
+        clear_screen()
+        ui_console.print(Panel(
+            "[bold red]🚀 AUTOMATIC PIPELINE[/bold red]\n"
+            "[yellow]Complete workflow in development mode[/yellow]",
+            box=box.DOUBLE, border_style="red"
+        ))
+        ui_console.print()
+
+        ui_console.print("[bold]This will run the complete workflow:[/bold]")
+        ui_console.print()
+        steps = [
+            ("1", "Enable dev mode", "Limit dataset to 1000 images"),
+            ("2", "Fetch metadata", "Download item info from pr0gramm API"),
+            ("3", "Download assets", "Download image files"),
+            ("4", "Prepare dataset", "Generate training CSV with tags"),
+            ("5", "Train model", "Train tag prediction neural network"),
+            ("6", "Validate", "Evaluate model on test set"),
+        ]
+
+        table = Table(box=box.SIMPLE, show_header=False)
+        table.add_column("Step", style="bold cyan", width=3)
+        table.add_column("Action", style="bold", width=20)
+        table.add_column("Description", style="dim")
+        for step, action, desc in steps:
+            table.add_row(step, action, desc)
+        ui_console.print(table)
+        ui_console.print()
+
+        options = {
+            "dev_mode": True,
+            "dev_limit": 1000,
+            "skip_fetch": False,
+            "skip_download": False,
+            "skip_prepare": False,
+            "skip_train": False,
+            "validate": True,
+            "include_videos": False,
+        }
+
+        # Allow customization
+        if Confirm.ask("[cyan]Customize settings?[/cyan]", default=False):
+            options["dev_limit"] = IntPrompt.ask("[cyan]Number of images to use[/cyan]", default=1000)
+            options["include_videos"] = Confirm.ask("[cyan]Include videos?[/cyan]", default=False)
+
+        ui_console.print()
+        if not Confirm.ask("[bold red]Start automatic pipeline?[/bold red]", default=True):
+            return {"cancelled": True}
+
+        return options
+
+    def configure_dev_mode(self) -> dict:
+        """Configure development mode settings."""
+        from pr0loader.utils.ui import clear_screen, console as ui_console
+
+        clear_screen()
+        ui_console.print(Panel(
+            "[bold cyan]🧪 Development Mode Settings[/bold cyan]\n"
+            "[dim]Configure development mode for faster testing[/dim]",
+            box=box.DOUBLE, border_style="blue"
+        ))
+        ui_console.print()
+
+        # Show current status
+        try:
+            from pr0loader.config import load_settings
+            settings = load_settings()
+            current_dev_mode = settings.dev_mode
+            current_limit = settings.dev_limit
+
+            status_table = Table(box=box.ROUNDED, title="Current Settings")
+            status_table.add_column("Setting", style="cyan")
+            status_table.add_column("Value", style="green")
+            status_table.add_row("Dev Mode", "✓ Enabled" if current_dev_mode else "✗ Disabled")
+            status_table.add_row("Item Limit", str(current_limit))
+            ui_console.print(status_table)
+            ui_console.print()
+        except:
+            current_dev_mode = False
+            current_limit = 1000
+
+        options = {}
+        options["enabled"] = Confirm.ask("[cyan]Enable development mode?[/cyan]", default=not current_dev_mode)
+
+        if options["enabled"]:
+            options["limit"] = IntPrompt.ask("[cyan]Max items to process[/cyan]", default=1000)
+
+        ui_console.print()
+        if not Confirm.ask("[bold]Save settings?[/bold]", default=True):
+            return {"cancelled": True}
+
+        return options
+
+    def configure_content_flags(self) -> dict:
+        """Configure content flags interactively."""
+        from pr0loader.utils.ui import clear_screen, console as ui_console
+
+        clear_screen()
+        ui_console.print(Panel(
+            "[bold cyan]🎭 Content Flags Settings[/bold cyan]\n"
+            "[dim]Configure which content types to include[/dim]",
+            box=box.DOUBLE, border_style="blue"
+        ))
+        ui_console.print()
+
+        # Show current status
+        try:
+            from pr0loader.config import load_settings
+            settings = load_settings()
+            current_flags = settings.content_flags
+        except:
+            current_flags = 15
+
+        ui_console.print(f"[dim]Current flags value: {current_flags}[/dim]")
+        ui_console.print()
+        ui_console.print("[cyan]Select content types to include:[/cyan]")
+        ui_console.print()
+
+        flags = 0
+        if Confirm.ask("  [green]SFW[/green] (Safe for Work)?", default=bool(current_flags & 1)):
+            flags |= 1
+        if Confirm.ask("  [yellow]NSFW[/yellow] (Not Safe for Work)?", default=bool(current_flags & 2)):
+            flags |= 2
+        if Confirm.ask("  [red]NSFL[/red] (Not Safe for Life)?", default=bool(current_flags & 4)):
+            flags |= 4
+        if Confirm.ask("  [magenta]POL[/magenta] (Political)?", default=bool(current_flags & 8)):
+            flags |= 8
+
+        if flags == 0:
+            ui_console.print("[yellow]Warning: No content types selected. Setting to SFW only.[/yellow]")
+            flags = 1
+
+        options = {"flags": flags}
+
+        self._show_options_summary("Content Flags", options)
+
+        if not Confirm.ask("\nSave settings?", default=True):
+            return {"cancelled": True}
+
+        return options
+
+    def configure_performance(self) -> dict:
+        """Configure performance settings."""
+        from pr0loader.utils.ui import clear_screen, console as ui_console
+
+        clear_screen()
+        ui_console.print(Panel(
+            "[bold cyan]⚡ Performance Settings[/bold cyan]\n"
+            "[dim]Tune performance for your system[/dim]",
+            box=box.DOUBLE, border_style="blue"
+        ))
+        ui_console.print()
+
+        # Show current setting
+        try:
+            from pr0loader.config import load_settings
+            settings = load_settings()
+            current_batch = settings.db_batch_size
+        except:
+            current_batch = 200
+
+        ui_console.print(f"[dim]Current batch size: {current_batch}[/dim]")
+        ui_console.print()
+        ui_console.print("[yellow]Database Batch Size:[/yellow]")
+        ui_console.print("  • Higher values = faster (especially on HDDs)")
+        ui_console.print("  • Lower values = less RAM usage")
+        ui_console.print()
+        ui_console.print("[dim]Recommended values:[/dim]")
+        ui_console.print("  • HDD: 100-200")
+        ui_console.print("  • SSD: 200-500")
+        ui_console.print("  • RAM disk: 500-1000")
+        ui_console.print()
+
+        batch_size = IntPrompt.ask(
+            "[cyan]Database batch size[/cyan]",
+            default=current_batch
+        )
+
+        options = {"db_batch_size": batch_size}
+
+        self._show_options_summary("Performance", options)
+
+        if not Confirm.ask("\nSave settings?", default=True):
+            return {"cancelled": True}
+
+        return options
+
+    def configure_validate(self) -> dict:
+        """Configure model validation options."""
+        from pr0loader.utils.ui import clear_screen, console as ui_console
+
+        clear_screen()
+        ui_console.print(Panel(
+            "[bold cyan]✅ Validate Model[/bold cyan]\n[dim]Evaluate model on test set[/dim]",
+            box=box.DOUBLE, border_style="blue"
+        ))
+        ui_console.print()
+
+        options = {}
+
+        # Find available test datasets and models
+        from pr0loader.config import load_settings
+        settings = load_settings()
+
+        test_datasets = sorted(
+            settings.output_dir.glob("*_test.csv"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True
+        )
+
+        if test_datasets:
+            ui_console.print("[cyan]Available test datasets:[/cyan]")
+            for i, ds in enumerate(test_datasets[:5], 1):
+                ui_console.print(f"  {i}. {ds.name}")
+            ui_console.print()
+
+            if Confirm.ask("Use most recent test dataset?", default=True):
+                options["test_csv_path"] = test_datasets[0]
+            else:
+                path = Prompt.ask("Test dataset path")
+                options["test_csv_path"] = Path(path) if path else None
+        else:
+            ui_console.print("[yellow]No test datasets found[/yellow]")
+            if Confirm.ask("Specify test dataset path?", default=False):
+                path = Prompt.ask("Test dataset path")
+                options["test_csv_path"] = Path(path) if path else None
+            else:
+                options["test_csv_path"] = None
+
+        ui_console.print()
+        if Confirm.ask("Use custom model?", default=False):
+            options["model_path"] = Path(Prompt.ask("Model path"))
+        else:
+            options["model_path"] = None
+
+        options["top_k"] = IntPrompt.ask("[cyan]Top-K accuracy to evaluate[/cyan]", default=5)
+
+        if not Confirm.ask("\n[bold]Run validation?[/bold]", default=True):
+            return {"cancelled": True}
+
+        return options
+
     def _show_options_summary(self, action: str, options: dict):
         """Show a summary of selected options."""
         self.console.print(f"\n[bold]Selected {action} Options:[/bold]")
@@ -873,12 +1290,28 @@ def run_interactive_menu() -> tuple[Optional[str], dict]:
     menu = InteractiveMenu()
     menu.show_header()
 
-    action = menu.show_main_menu()
+    while True:
+        action = menu.show_main_menu()
 
-    if action == "quit" or action is None:
-        return None, {}
+        if action == "quit" or action is None:
+            return None, {}
 
-    # Configure options based on action
+        # Handle submenus
+        if action.startswith("menu_"):
+            while True:
+                sub_action = menu.show_submenu(action)
+                if sub_action == "back" or sub_action is None:
+                    break
+                # Return the sub_action to be executed
+                return _configure_action(menu, sub_action)
+            continue  # Back to main menu
+
+        # Handle direct actions
+        return _configure_action(menu, action)
+
+
+def _configure_action(menu: InteractiveMenu, action: str) -> tuple[Optional[str], dict]:
+    """Configure options for an action and return (action, options)."""
     options = {}
 
     if action == "sync":
@@ -901,7 +1334,17 @@ def run_interactive_menu() -> tuple[Optional[str], dict]:
         options = menu.configure_serve()
     elif action == "login":
         options = menu.configure_login()
-    # info, logout don't need configuration
+    elif action == "auto_pipeline":
+        options = menu.configure_auto_pipeline()
+    elif action == "settings_dev":
+        options = menu.configure_dev_mode()
+    elif action == "settings_flags":
+        options = menu.configure_content_flags()
+    elif action == "settings_performance":
+        options = menu.configure_performance()
+    elif action == "validate":
+        options = menu.configure_validate()
+    # info, logout, setup, init don't need configuration
 
     return action, options
 

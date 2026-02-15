@@ -157,6 +157,18 @@ class PreparePipeline:
                         if row:
                             writer.writerow(row)
                             self.stats.items_processed += 1
+
+                            # Verbose logging: show prepared item
+                            if logger.isEnabledFor(logging.DEBUG):
+                                tags = [row.get(f'tag{i}') for i in range(1, 6) if row.get(f'tag{i}')]
+                                nsfw_flags = []
+                                if row.get('is_nsfw') == 'true': nsfw_flags.append('NSFW')
+                                if row.get('is_nsfl') == 'true': nsfw_flags.append('NSFL')
+                                if row.get('is_nsfp') == 'true': nsfw_flags.append('NSFP')
+                                flags_str = f" [{', '.join(nsfw_flags)}]" if nsfw_flags else ""
+                                logger.debug(
+                                    f"Prepared item {item.id}: {', '.join(tags[:3])}{flags_str}"
+                                )
                         else:
                             self.stats.items_skipped += 1
 

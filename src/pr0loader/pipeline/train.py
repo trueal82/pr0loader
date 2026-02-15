@@ -34,12 +34,36 @@ class TrainPipeline:
         """Check if TensorFlow is available."""
         try:
             import tensorflow as tf
-            gpu_available = bool(tf.config.list_physical_devices('GPU'))
+            gpu_devices = tf.config.list_physical_devices('GPU')
+            gpu_available = bool(gpu_devices)
+
             print_info(f"TensorFlow version: {tf.__version__}")
             print_info(f"GPU available: {gpu_available}")
+
+            if gpu_available:
+                for gpu in gpu_devices:
+                    try:
+                        gpu_name = tf.config.experimental.get_device_details(gpu).get('device_name', 'Unknown GPU')
+                        print_info(f"  GPU: {gpu_name}")
+                        logger.info(f"Using GPU: {gpu_name}")
+                    except:
+                        print_info(f"  GPU: {gpu.name}")
+                        logger.info(f"Using GPU: {gpu.name}")
+            else:
+                print_warning("No GPU detected - training will use CPU (slower)")
+                print_info("For GPU support, ensure CUDA toolkit is installed")
+                logger.warning("Training on CPU - this will be significantly slower")
+
             return True
         except ImportError:
-            print_error("TensorFlow not installed. Install with: pip install pr0loader[ml]")
+            import sys
+            print_error("TensorFlow not installed. Install with: pip install 'pr0loader[ml]'")
+            python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+            if sys.version_info >= (3, 13):
+                print_warning(f"You're using Python {python_version}, but TensorFlow requires Python 3.10-3.12")
+                print_info("Create a venv with Python 3.12: py -3.12 -m venv .venv")
+            else:
+                print_info("For GPU support: Install CUDA toolkit first, then tensorflow")
             return False
 
     def run(self, csv_path: Path, output_path: Optional[Path] = None) -> Optional[Path]:
@@ -181,13 +205,26 @@ class TrainPipeline:
         # Train
         print_info(f"Starting training for {self.settings.num_epochs} epochs...")
         print_info(f"Batch size: {self.settings.batch_size}")
+        print_info(f"Learning rate: {self.settings.learning_rate}")
+
+        # Verbose logging: show dataset sample
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"Dataset: {len(df)} samples")
+            logger.debug(f"Image size: {image_size}")
+            logger.debug(f"Classes: {num_classes} unique tags")
+            # Show some example tags
+            example_tags = list(self.tag_to_idx.keys())[:10]
+            logger.debug(f"Example tags: {', '.join(example_tags)}")
 
         try:
+            # Use verbose=2 for detailed epoch progress when verbose logging is on
+            verbosity = 2 if logger.isEnabledFor(logging.DEBUG) else (1 if not is_headless() else 2)
+
             history = model.fit(
                 dataset,
                 epochs=self.settings.num_epochs,
                 callbacks=callbacks,
-                verbose=1 if not is_headless() else 2
+                verbose=verbosity
             )
         except Exception as e:
             print_error(f"Training failed: {e}")

@@ -71,6 +71,11 @@ class FetchPipeline:
             print_info(f"Estimated items: ~{estimated_items:,}")
 
             current_id = start_id
+            batch = []  # Accumulate items for batch insert
+            batch_size = self.settings.db_batch_size
+
+            logger.info(f"Using batch size: {batch_size} items per commit")
+            print_info(f"DB batch size: {batch_size} items")
 
             progress = create_progress("Fetching")
             with progress:
@@ -96,11 +101,26 @@ class FetchPipeline:
                                 item.tags = info.tags
                                 item.comments = info.comments
 
-                                # Store in database
-                                storage.upsert_item(item)
-                                self.stats.items_processed += 1
+                                # Verbose logging: show item details
+                                if logger.isEnabledFor(logging.DEBUG):
+                                    tag_names = [t.tag for t in item.tags[:5]]  # First 5 tags
+                                    tag_str = ", ".join(tag_names) if tag_names else "no tags"
+                                    logger.debug(
+                                        f"Item {item.id}: {item.image} | "
+                                        f"👍{item.up} 👎{item.down} | "
+                                        f"Tags: {tag_str}"
+                                    )
 
+                                # Add to batch
+                                batch.append(item)
+                                self.stats.items_processed += 1
                                 progress.update(task, advance=1)
+
+                                # Flush batch to database when it reaches batch_size
+                                if len(batch) >= batch_size:
+                                    storage.upsert_items_batch(batch)
+                                    logger.debug(f"Flushed batch of {len(batch)} items to DB")
+                                    batch = []
 
                             except Exception as e:
                                 logger.error(f"Failed to process item {item.id}: {e}")
@@ -120,6 +140,11 @@ class FetchPipeline:
                     except Exception as e:
                         logger.error(f"Error during fetch: {e}")
                         self.stats.items_failed += 1
+
+                # Flush any remaining items in the batch
+                if batch:
+                    storage.upsert_items_batch(batch)
+                    logger.debug(f"Flushed final batch of {len(batch)} items to DB")
 
             # Print final stats
             print_stats_table("Fetch Results", {

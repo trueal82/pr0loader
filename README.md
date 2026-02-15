@@ -15,17 +15,83 @@ A beautiful CLI toolchain for fetching, processing, and training ML models on pr
 
 ## 🚀 Installation
 
+**Requirements:**
+- Python 3.10, 3.11, or 3.12 (TensorFlow doesn't support 3.13+ yet)
+- For GPU training: NVIDIA GPU with CUDA 11.8 or 12.x
+
+### Quick Start (Recommended: using uv)
+
+[uv](https://docs.astral.sh/uv/) is a blazingly fast Python package manager (10-100x faster than pip!)
+
+```bash
+# Install uv (if not already installed)
+# Windows (PowerShell)
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+# Linux/Mac
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Clone the repository
+git clone https://github.com/yourusername/pr0loader.git
+cd pr0loader
+
+# uv automatically uses Python 3.12 (from .python-version file)
+# Create venv and install with ML features
+uv venv
+uv pip install -e ".[ml]"
+
+# Activate the environment
+.venv\Scripts\activate         # Windows
+source .venv/bin/activate      # Linux/Mac
+```
+
+### Alternative: Using pip
+
 ```bash
 # Clone the repository
 git clone https://github.com/yourusername/pr0loader.git
 cd pr0loader
 
-# Install in development mode
-pip install -e .
+# Create virtual environment with Python 3.12
+py -3.12 -m venv .venv         # Windows
+python3.12 -m venv .venv       # Linux/Mac
 
-# For ML features (training/prediction), install with extras:
+# Activate virtual environment
+.venv\Scripts\activate         # Windows
+source .venv/bin/activate      # Linux/Mac
+
+# Install with ML features
 pip install -e ".[ml]"
 ```
+
+### GPU Support (Recommended for Training)
+
+For faster training with NVIDIA GPUs, TensorFlow 2.15+ automatically uses CUDA when available:
+
+**Requirements:**
+- NVIDIA GPU with CUDA Compute Capability 3.5 or higher
+- CUDA Toolkit 11.8 or 12.x
+- cuDNN 8.6+
+
+**Installation:**
+
+```bash
+# 1. Install CUDA Toolkit from NVIDIA
+# Download from: https://developer.nvidia.com/cuda-downloads
+
+# 2. Install pr0loader with ML extras
+uv pip install -e ".[ml]"
+# or: pip install -e ".[ml]"
+
+# 3. Verify GPU is detected
+pr0loader --version
+# When running train/e2e-test, you should see:
+# "GPU available: True"
+```
+
+**Note:** TensorFlow 2.10+ has built-in GPU support. No need to install `tensorflow-gpu` separately.
+
+If GPU is not detected, training will still work but use CPU (much slower).
 
 ## ⚙️ Configuration
 
@@ -367,6 +433,34 @@ pr0loader/
 
 ## 🔧 Development
 
+### Using uv (Recommended)
+
+```bash
+# Create venv with Python 3.12 (auto-detected from .python-version)
+uv venv
+
+# Activate venv
+.venv\Scripts\activate         # Windows
+source .venv/bin/activate      # Linux/Mac
+
+# Install with all dependencies including dev tools
+uv pip install -e ".[all,dev]"
+
+# Add a new dependency
+uv pip install package-name
+
+# Update dependencies
+uv pip install --upgrade -e ".[all,dev]"
+
+# Run tests
+pytest
+
+# Format code
+black src/
+```
+
+### Using pip
+
 ```bash
 # Install with dev dependencies
 pip install -e ".[dev]"
@@ -377,6 +471,19 @@ pytest
 # Format code
 black src/
 ```
+
+### Quick Reference: uv vs pip
+
+| Task | uv | pip |
+|------|----|----|
+| Create venv | `uv venv` | `python -m venv .venv` |
+| Install package | `uv pip install pkg` | `pip install pkg` |
+| Install from pyproject.toml | `uv pip install -e ".[ml]"` | `pip install -e ".[ml]"` |
+| Update package | `uv pip install --upgrade pkg` | `pip install --upgrade pkg` |
+| List installed | `uv pip list` | `pip list` |
+| Uninstall | `uv pip uninstall pkg` | `pip uninstall pkg` |
+
+**Why uv?** 10-100x faster, better dependency resolution, automatic Python version detection.
 
 ## 📄 License
 

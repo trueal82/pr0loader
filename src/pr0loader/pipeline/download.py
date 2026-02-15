@@ -66,14 +66,27 @@ class DownloadPipeline:
                     total=total_items
                 )
 
+                items_processed = 0
                 for item in storage.iter_items():
                     progress.update(task, advance=1)
+                    items_processed += 1
+
+                    # Verbose: periodic progress updates
+                    if logger.isEnabledFor(logging.DEBUG) and items_processed % 100 == 0:
+                        logger.debug(
+                            f"Progress: {items_processed}/{total_items} | "
+                            f"Downloaded: {self.stats.files_downloaded}, "
+                            f"Skipped: {self.stats.files_skipped}, "
+                            f"Failed: {self.stats.items_failed}"
+                        )
 
                     # Skip videos unless explicitly included
                     if not include_videos:
                         ext = Path(item.image).suffix.lower()
                         if ext not in {'.jpg', '.jpeg', '.png', '.gif'}:
                             self.stats.items_skipped += 1
+                            if logger.isEnabledFor(logging.DEBUG):
+                                logger.debug(f"Skipped video: {item.image}")
                             continue
 
                     # Build paths
@@ -82,16 +95,28 @@ class DownloadPipeline:
                     # Skip if already exists
                     if destination.exists():
                         self.stats.files_skipped += 1
+                        if logger.isEnabledFor(logging.DEBUG) and self.stats.files_skipped % 50 == 1:
+                            logger.debug(f"File exists (#{self.stats.files_skipped}): {destination.name}")
                         continue
 
                     try:
+                        # Verbose: show what we're about to download
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"Downloading: {item.image}")
+
                         # Download file
                         size = self.api.download_media(item.image, destination)
                         self.stats.files_downloaded += 1
                         self.stats.bytes_downloaded += size
 
+                        # Verbose logging: show download details
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(
+                                f"✓ Downloaded {item.image} ({format_bytes(size)})"
+                            )
+
                     except Exception as e:
-                        logger.error(f"Failed to download {item.image}: {e}")
+                        logger.error(f"✗ Failed to download {item.image}: {e}")
                         self.stats.items_failed += 1
 
             # Print final stats

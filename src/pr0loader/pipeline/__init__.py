@@ -6,6 +6,7 @@ from pr0loader.pipeline.prepare import PreparePipeline
 from pr0loader.pipeline.train import TrainPipeline
 from pr0loader.pipeline.predict import PredictPipeline
 from pr0loader.pipeline.sync import SyncPipeline
+from pr0loader.pipeline.validate import ValidatePipeline
 
 __all__ = [
     "FetchPipeline",
@@ -14,5 +15,6 @@ __all__ = [
     "TrainPipeline",
     "PredictPipeline",
     "SyncPipeline",
+    "ValidatePipeline",
 ]
 

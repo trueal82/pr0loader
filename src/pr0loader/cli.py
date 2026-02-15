@@ -53,10 +53,20 @@ def setup_logging(verbose: bool, headless: bool):
             datefmt='%Y-%m-%d %H:%M:%S'
         )
     else:
-        # Quieter logging when using Rich
+        # Use Rich handler for better integration with progress bars
+        from rich.logging import RichHandler
+
         logging.basicConfig(
-            level=logging.WARNING,
-            format='%(message)s'
+            level=level if verbose else logging.WARNING,
+            format='%(message)s',
+            datefmt='%H:%M:%S',
+            handlers=[RichHandler(
+                console=console,
+                rich_tracebacks=True,
+                show_time=verbose,
+                show_path=verbose,
+                markup=True,
+            )]
         )
 
     set_headless(headless)
@@ -157,6 +167,10 @@ def _run_interactive(ctx: typer.Context):
             console.print("\n[dim]Goodbye![/dim]")
             raise typer.Exit(0)
 
+        # Check for cancelled operations
+        if options.get("cancelled"):
+            continue
+
         # Execute the selected action with options
         try:
             settings = load_settings()
@@ -187,6 +201,18 @@ def _run_interactive(ctx: typer.Context):
                 _execute_logout()
             elif action == "setup":
                 _execute_setup()
+            elif action == "init":
+                _execute_init(settings)
+            elif action == "auto_pipeline":
+                _execute_auto_pipeline(settings, options)
+            elif action == "settings_dev":
+                _execute_settings_dev(options)
+            elif action == "settings_flags":
+                _execute_settings_flags(options)
+            elif action == "settings_performance":
+                _execute_settings_performance(options)
+            elif action == "validate":
+                _execute_validate(settings, options)
 
         except KeyboardInterrupt:
             console.print("\n[yellow]Interrupted[/yellow]")
@@ -194,15 +220,17 @@ def _run_interactive(ctx: typer.Context):
             print_error(f"Error: {e}")
 
         # Pause before returning to menu
-        console.print()
-        from rich.prompt import Prompt
-        Prompt.ask("[dim]Press Enter to return to menu[/dim]", default="")
+        from pr0loader.utils.ui import wait_for_key
+        wait_for_key("Press Enter to return to menu")
 
 
 def _execute_info():
     """Execute info command from interactive menu."""
-    # Show banner already shown by menu, so just run info logic
-    print_header("System Information", "Database and configuration overview")
+    from pr0loader.utils.ui import clear_screen, render_header, get_status_info
+
+    clear_screen()
+    console.print(render_header("📊 System Information", "Database and configuration overview"))
+    console.print()
 
     try:
         settings = load_settings()
@@ -476,6 +504,218 @@ def _execute_setup():
     """Execute setup wizard."""
     from pr0loader.utils.setup import run_setup_wizard
     run_setup_wizard()
+
+
+def _execute_init(settings: Settings):
+    """Execute init - create data directories."""
+    print_header("🏗️ Initialize", "Creating data directories")
+    settings.ensure_directories()
+    print_success("Directories created")
+
+
+def _execute_auto_pipeline(settings: Settings, options: dict):
+    """Execute the automatic pipeline (big red button)."""
+    print_header("🚀 AUTOMATIC PIPELINE", "Running complete workflow in dev mode")
+
+    # Enable dev mode
+    settings.dev_mode = True
+    settings.dev_limit = options.get("dev_limit", 1000)
+
+    # Check auth
+    if not check_auth_for_content_flags(settings, headless=False):
+        return
+
+    console.print(f"\n[cyan]Dev mode enabled: limiting to {settings.dev_limit} items[/cyan]\n")
+
+    total_steps = 5
+    current_step = 0
+
+    # Step 1: Fetch
+    current_step += 1
+    console.print(f"\n[bold cyan]═══ Step {current_step}/{total_steps}: Fetch Metadata ═══[/bold cyan]")
+    from pr0loader.pipeline import FetchPipeline
+    FetchPipeline(settings).run()
+
+    # Step 2: Download
+    current_step += 1
+    console.print(f"\n[bold cyan]═══ Step {current_step}/{total_steps}: Download Assets ═══[/bold cyan]")
+    from pr0loader.pipeline import DownloadPipeline
+    DownloadPipeline(settings).run(include_videos=options.get("include_videos", False))
+
+    # Step 3: Prepare
+    current_step += 1
+    console.print(f"\n[bold cyan]═══ Step {current_step}/{total_steps}: Prepare Dataset ═══[/bold cyan]")
+    from pr0loader.pipeline import PreparePipeline
+    _, dataset_path = PreparePipeline(settings).run()
+
+    # Step 4: Train
+    current_step += 1
+    console.print(f"\n[bold cyan]═══ Step {current_step}/{total_steps}: Train Model ═══[/bold cyan]")
+    from pr0loader.pipeline import TrainPipeline
+    TrainPipeline(settings).run(csv_path=dataset_path)
+
+    # Step 5: Validate
+    current_step += 1
+    console.print(f"\n[bold cyan]═══ Step {current_step}/{total_steps}: Validate Model ═══[/bold cyan]")
+    # Note: For auto_pipeline, we'd need to split the dataset first
+    # Currently this just shows a placeholder. Use e2e-test for full validation.
+    print_info("Validation step - model performance metrics")
+    print_warning("Use 'pr0loader e2e-test' for full pipeline with train/test split and validation")
+
+    console.print()
+    print_header("🎉 Pipeline Complete!", f"Processed {settings.dev_limit} items")
+    print_info(f"Model saved to: {settings.model_path}")
+
+
+def _execute_settings_dev(options: dict):
+    """Execute dev mode toggle."""
+    if options.get("cancelled"):
+        return
+
+    print_header("🧪 Dev Mode", "Updating development mode settings")
+
+    # Update the .env file
+    from pathlib import Path
+    env_path = Path(".env")
+
+    if not env_path.exists():
+        print_error("No .env file found. Run 'pr0loader setup' first.")
+        return
+
+    enabled = options.get("enabled", False)
+    limit = options.get("limit", 1000)
+
+    # Read current .env
+    content = env_path.read_text()
+    lines = content.split("\n")
+    new_lines = []
+
+    dev_mode_found = False
+    dev_limit_found = False
+
+    for line in lines:
+        if line.strip().startswith("DEV_MODE"):
+            new_lines.append(f"DEV_MODE = {'true' if enabled else 'false'}")
+            dev_mode_found = True
+        elif line.strip().startswith("DEV_LIMIT"):
+            new_lines.append(f"DEV_LIMIT = {limit}")
+            dev_limit_found = True
+        else:
+            new_lines.append(line)
+
+    # Add if not found
+    if not dev_mode_found:
+        new_lines.append(f"DEV_MODE = {'true' if enabled else 'false'}")
+    if not dev_limit_found:
+        new_lines.append(f"DEV_LIMIT = {limit}")
+
+    env_path.write_text("\n".join(new_lines))
+
+    print_success(f"Dev mode {'enabled' if enabled else 'disabled'}")
+    if enabled:
+        print_info(f"Limit set to {limit} items")
+
+
+def _execute_settings_performance(options: dict):
+    """Execute performance settings update."""
+    if options.get("cancelled"):
+        return
+
+    print_header("⚡ Performance Settings", "Updating performance configuration")
+
+    batch_size = options.get("db_batch_size", 200)
+
+    # Update the .env file
+    from pathlib import Path
+    env_path = Path(".env")
+
+    if not env_path.exists():
+        print_error("No .env file found. Run 'pr0loader setup' first.")
+        return
+
+    lines = env_path.read_text().splitlines()
+    new_lines = []
+    batch_found = False
+
+    for line in lines:
+        if line.startswith("DB_BATCH_SIZE"):
+            new_lines.append(f"DB_BATCH_SIZE = {batch_size}")
+            batch_found = True
+        else:
+            new_lines.append(line)
+
+    # Add if not found
+    if not batch_found:
+        new_lines.append(f"DB_BATCH_SIZE = {batch_size}")
+
+    env_path.write_text("\n".join(new_lines))
+
+    print_success(f"Database batch size set to {batch_size}")
+    print_info("This will take effect on the next fetch operation")
+
+
+def _execute_settings_flags(options: dict):
+    """Execute content flags update."""
+    if options.get("cancelled"):
+        return
+
+    print_header("🎭 Content Flags", "Updating content flag settings")
+
+    flags = options.get("flags", 15)
+
+    # Update the .env file
+    from pathlib import Path
+    env_path = Path(".env")
+
+    if not env_path.exists():
+        print_error("No .env file found. Run 'pr0loader setup' first.")
+        return
+
+    content = env_path.read_text()
+    lines = content.split("\n")
+    new_lines = []
+
+    flags_found = False
+
+    for line in lines:
+        if line.strip().startswith("CONTENT_FLAGS"):
+            new_lines.append(f"CONTENT_FLAGS = {flags}")
+            flags_found = True
+        else:
+            new_lines.append(line)
+
+    if not flags_found:
+        new_lines.append(f"CONTENT_FLAGS = {flags}")
+
+    env_path.write_text("\n".join(new_lines))
+
+    # Describe the flags
+    desc = []
+    if flags & 1: desc.append("SFW")
+    if flags & 2: desc.append("NSFW")
+    if flags & 4: desc.append("NSFL")
+    if flags & 8: desc.append("POL")
+
+    print_success(f"Content flags set to {flags} ({'+'.join(desc)})")
+
+
+def _execute_validate(settings: Settings, options: dict):
+    """Execute model validation."""
+    from pr0loader.pipeline import ValidatePipeline
+
+    model_path = options.get("model_path")
+    test_csv_path = options.get("test_csv_path")
+    top_k = options.get("top_k", 5)
+
+    pipeline = ValidatePipeline(settings)
+    metrics = pipeline.run(
+        model_path=model_path,
+        test_csv_path=test_csv_path,
+        top_k=top_k
+    )
+
+    if not metrics:
+        print_error("Validation failed")
 
 
 def _execute_api(settings: Settings, options: dict):
@@ -1387,6 +1627,134 @@ def auth_status(ctx: typer.Context):
 def version():
     """Show version information."""
     console.print(f"pr0loader version {__version__}")
+
+
+@app.command("e2e-test")
+def e2e_test(
+    ctx: typer.Context,
+    limit: int = typer.Option(1000, "--limit", "-l", help="Number of images to use (dev mode)"),
+    skip_fetch: bool = typer.Option(False, "--skip-fetch", help="Skip fetch step"),
+    skip_download: bool = typer.Option(False, "--skip-download", help="Skip download step"),
+    train_ratio: float = typer.Option(0.8, "--train-ratio", "-r", help="Train/test split ratio"),
+    top_k: int = typer.Option(5, "--top-k", "-k", help="Top-K accuracy to evaluate"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose output with detailed logging"),
+):
+    """🧪 End-to-End Test: Complete pipeline with validation.
+
+    Runs the full workflow in dev mode:
+    1. Fetch metadata (optional)
+    2. Download images (optional)
+    3. Prepare dataset
+    4. Split into train/test sets
+    5. Train model on train set
+    6. Validate on test set
+    7. Show performance metrics
+    """
+    headless = ctx.obj.get("headless", False)
+
+    # Configure logging for verbose mode
+    if verbose:
+        setup_logging(verbose=True, headless=headless)
+        logger = logging.getLogger(__name__)
+        logger.info("Verbose mode enabled")
+
+    if not headless:
+        show_banner()
+
+    print_header(
+        "🧪 End-to-End Test",
+        f"Complete pipeline with {limit} images and validation"
+    )
+
+    try:
+        settings = load_settings()
+
+        # Force dev mode and SFW-only for e2e test
+        settings.dev_mode = True
+        settings.dev_limit = limit
+        settings.content_flags = 1  # SFW only - no auth required
+
+        print_info(f"Dev mode: processing {limit} images")
+        print_info(f"Content: SFW only (no auth required)")
+        print_info(f"Train/test split: {train_ratio:.0%} / {(1-train_ratio):.0%}")
+        if verbose:
+            print_info("Verbose logging enabled")
+        console.print()
+
+        total_steps = 5 - (1 if skip_fetch else 0) - (1 if skip_download else 0)
+        current_step = 0
+
+        # Step 1: Fetch (optional)
+        if not skip_fetch:
+            current_step += 1
+            console.print(f"\n[bold cyan]═══ Step {current_step}/{total_steps}: Fetch Metadata ═══[/bold cyan]")
+            from pr0loader.pipeline import FetchPipeline
+            FetchPipeline(settings).run()
+
+        # Step 2: Download (optional)
+        if not skip_download:
+            current_step += 1
+            console.print(f"\n[bold cyan]═══ Step {current_step}/{total_steps}: Download Images ═══[/bold cyan]")
+            from pr0loader.pipeline import DownloadPipeline
+            DownloadPipeline(settings).run(include_videos=False)
+
+        # Step 3: Prepare dataset
+        current_step += 1
+        console.print(f"\n[bold cyan]═══ Step {current_step}/{total_steps}: Prepare Dataset ═══[/bold cyan]")
+        from pr0loader.pipeline import PreparePipeline
+        _, dataset_path = PreparePipeline(settings).run()
+
+        # Step 4: Split into train/test
+        current_step += 1
+        console.print(f"\n[bold cyan]═══ Step {current_step}/{total_steps}: Split Train/Test ═══[/bold cyan]")
+        from pr0loader.pipeline import ValidatePipeline
+        validate_pipeline = ValidatePipeline(settings)
+        train_path, test_path = validate_pipeline.split_dataset(
+            dataset_path,
+            train_ratio=train_ratio
+        )
+
+        # Step 5: Train model
+        current_step += 1
+        console.print(f"\n[bold cyan]═══ Step {current_step}/{total_steps}: Train Model ═══[/bold cyan]")
+        from pr0loader.pipeline import TrainPipeline
+        model_path = TrainPipeline(settings).run(csv_path=train_path)
+
+        if not model_path:
+            print_error("Training failed")
+            raise typer.Exit(1)
+
+        # Step 6: Validate model
+        current_step += 1
+        console.print(f"\n[bold cyan]═══ Step {current_step}/{total_steps}: Validate Model ═══[/bold cyan]")
+        metrics = validate_pipeline.evaluate_model(
+            model_path=model_path,
+            test_csv_path=test_path,
+            top_k=top_k
+        )
+
+        # Final summary
+        console.print()
+        print_header("🎉 E2E Test Complete!", "Pipeline finished successfully")
+
+        console.print()
+        print_info(f"Dataset size: {limit} images")
+        print_info(f"Train set: {train_path.name}")
+        print_info(f"Test set: {test_path.name}")
+        print_info(f"Model: {model_path.name}")
+        console.print()
+
+        if metrics:
+            print_success(f"✓ F1 Score: {metrics['f1_score']:.4f}")
+            print_success(f"✓ Top-{top_k} Accuracy: {metrics[f'top_{top_k}_accuracy']:.4f}")
+            print_success(f"✓ Mean AP: {metrics['mean_average_precision']:.4f}")
+
+    except KeyboardInterrupt:
+        print_warning("\nE2E test interrupted by user")
+        raise typer.Exit(130)
+    except Exception as e:
+        print_error(f"E2E test failed: {e}")
+        raise typer.Exit(1)
 
 
 if __name__ == "__main__":

@@ -86,8 +86,13 @@ class SQLiteStorage:
 
         self.conn.commit()
 
-    def upsert_item(self, item: Item):
-        """Insert or update an item."""
+    def upsert_item(self, item: Item, commit: bool = True):
+        """Insert or update an item.
+
+        Args:
+            item: Item to upsert
+            commit: If True, commits immediately. If False, caller must commit manually.
+        """
         cursor = self.conn.cursor()
 
         tags_json = json.dumps([t.model_dump() for t in item.tags])
@@ -95,7 +100,7 @@ class SQLiteStorage:
         item_json = json.dumps(item.model_dump(exclude={'tags', 'comments'}))
 
         cursor.execute('''
-            INSERT OR REPLACE INTO items 
+            INSERT OR REPLACE INTO items
             (id, image, promoted, up, down, created, width, height, audio, source,
              flags, user_name, mark, gift, item_data, tags_data, comments_data, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
@@ -113,7 +118,66 @@ class SQLiteStorage:
                 (item.id, tag.tag, tag.confidence)
             )
 
+        if commit:
+            self.conn.commit()
+
+    def upsert_items_batch(self, items: list[Item]):
+        """Insert or update multiple items in a single transaction.
+
+        This is much faster than calling upsert_item() repeatedly, especially
+        on HDDs, as it only commits once at the end.
+
+        Args:
+            items: List of items to upsert
+        """
+        if not items:
+            return
+
+        cursor = self.conn.cursor()
+
+        # Prepare batch data
+        items_data = []
+        tags_to_delete = []
+        tags_data = []
+
+        for item in items:
+            tags_json = json.dumps([t.model_dump() for t in item.tags])
+            comments_json = json.dumps([c.model_dump() for c in item.comments])
+            item_json = json.dumps(item.model_dump(exclude={'tags', 'comments'}))
+
+            items_data.append((
+                item.id, item.image, item.promoted, item.up, item.down, item.created,
+                item.width, item.height, item.audio, item.source, item.flags,
+                item.user, item.mark, item.gift, item_json, tags_json, comments_json
+            ))
+
+            tags_to_delete.append(item.id)
+            for tag in item.tags:
+                tags_data.append((item.id, tag.tag, tag.confidence))
+
+        # Execute batch inserts
+        cursor.executemany('''
+            INSERT OR REPLACE INTO items
+            (id, image, promoted, up, down, created, width, height, audio, source,
+             flags, user_name, mark, gift, item_data, tags_data, comments_data, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+        ''', items_data)
+
+        # Delete old tags for all items
+        if tags_to_delete:
+            placeholders = ','.join('?' * len(tags_to_delete))
+            cursor.execute(f'DELETE FROM tags WHERE item_id IN ({placeholders})', tags_to_delete)
+
+        # Insert new tags
+        if tags_data:
+            cursor.executemany(
+                'INSERT INTO tags (item_id, tag, confidence) VALUES (?, ?, ?)',
+                tags_data
+            )
+
+        # Single commit for entire batch
         self.conn.commit()
+        logger.debug(f"Batch upserted {len(items)} items")
 
     def get_min_id(self) -> int:
         """Get the minimum item ID."""

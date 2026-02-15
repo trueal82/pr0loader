@@ -89,6 +89,10 @@ class Settings(BaseSettings):
     # Processing
     full_update: bool = Field(default=False, description="Perform full update")
     start_from: Optional[int] = Field(default=None, description="Start from specific ID")
+    db_batch_size: int = Field(
+        default=200,
+        description="Number of items to batch before committing to database (higher = faster but more RAM)"
+    )
 
     # Dataset preparation
     min_valid_tags: int = Field(default=5, description="Minimum valid tags per item")
