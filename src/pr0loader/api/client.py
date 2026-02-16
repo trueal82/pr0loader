@@ -7,10 +7,9 @@ from typing import Optional
 
 import requests
 from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 from pr0loader.config import Settings
-from pr0loader.models import Item, ItemsResponse, ItemInfoResponse, Tag, Comment
+from pr0loader.models import ItemsResponse, ItemInfoResponse
 from pr0loader.utils.backoff import BackoffStrategy, fibonacci_backoff
 
 logger = logging.getLogger(__name__)
@@ -169,26 +168,58 @@ class APIClient:
         raise Exception(f"Failed to download {filename} after {self.settings.max_retries} attempts")
 
     def get_remote_file_size(self, filename: str) -> Optional[int]:
-        """
-        Get the size of a remote file using HEAD request.
+        """Get the size of a remote file using HEAD request.
+
+        Important: This MUST honor rate limiting (HTTP 429) using the same Fibonacci
+        backoff strategy as other API calls. We want to be a friendly client.
 
         Returns:
             File size in bytes, or None if unavailable.
         """
         url = f"{self.settings.media_base_url}/{filename}"
 
-        try:
-            response = self.session.head(url, timeout=self.settings.request_timeout)
-            response.raise_for_status()
+        tries = 0
+        while tries < self.settings.max_retries:
+            tries += 1
+            try:
+                if tries > 1:
+                    logger.debug(f"HEAD retry {tries}/{self.settings.max_retries}: {url}")
 
-            content_length = response.headers.get("Content-Length")
-            if content_length:
-                return int(content_length)
-            return None
+                response = self.session.head(url, timeout=self.settings.request_timeout)
+                response.raise_for_status()
 
-        except requests.RequestException as e:
-            logger.debug(f"HEAD request failed for {filename}: {e}")
-            return None
+                content_length = response.headers.get("Content-Length")
+                self.backoff.reset()
+                return int(content_length) if content_length else None
+
+            except requests.HTTPError as e:
+                status_code = e.response.status_code if e.response else None
+
+                if status_code == 429:
+                    wait_time = self.backoff.next()
+                    api_suggested = e.response.headers.get("Retry-After", "unknown")
+                    logger.warning(
+                        f"Rate limited on HEAD (API suggests {api_suggested}s). "
+                        f"Using Fibonacci backoff: {wait_time}s (attempt #{self.backoff.attempt})"
+                    )
+                    time.sleep(wait_time)
+                    continue
+
+                if status_code and 400 <= status_code < 500:
+                    # For HEAD verification, treat client errors as 'unknown remote size'
+                    logger.info(f"HEAD client error for {filename}: {status_code}")
+                    self.backoff.reset()
+                    return None
+
+                logger.debug(f"HEAD HTTP error for {filename}: {e}")
+                time.sleep(2 ** min(tries, 6))
+
+            except requests.RequestException as e:
+                logger.debug(f"HEAD request failed for {filename}: {e}")
+                time.sleep(2 ** min(tries, 6))
+
+        # If HEAD verification ultimately fails, return None (caller decides policy)
+        return None
 
     def needs_download(self, filename: str, local_path: Path) -> bool:
         """
@@ -215,5 +246,4 @@ class APIClient:
             return True
 
         return False
-
 

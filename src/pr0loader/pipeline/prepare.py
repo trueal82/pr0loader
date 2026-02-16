@@ -14,8 +14,6 @@ import multiprocessing as mp
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
-from functools import partial
-from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
@@ -47,35 +45,88 @@ CONTENT_FLAGS = frozenset({'nsfw', 'nsfl', 'nsfp', 'sfw'})
 IMAGENET_MEAN = np.array([103.939, 116.779, 123.68], dtype=np.float32)
 
 
-def _preprocess_image_for_resnet(args: tuple) -> Optional[np.ndarray]:
+def _preprocess_image_for_resnet(args: tuple) -> tuple[Optional[np.ndarray], Optional[str]]:
     """
     Load and preprocess a single image for ResNet50.
 
     This is a module-level function to work with multiprocessing (avoids GIL).
     All operations use numpy/PIL which release the GIL.
 
+    Designed to be FAILSAFE - returns (None, error_reason) on any failure,
+    never raises an exception. This is critical for long-running prepare jobs.
+
     Args:
         args: Tuple of (image_path, media_prefix, image_size)
 
     Returns:
-        Preprocessed float32 array (H, W, 3) ready for ResNet50, or None if failed
+        Tuple of (preprocessed_array, error_reason)
+        - On success: (float32 array (H, W, 3), None)
+        - On failure: (None, "reason string")
     """
     image_path, media_prefix_str, image_size = args
 
     try:
-        from PIL import Image
+        from PIL import Image, UnidentifiedImageError
+    except ImportError:
+        return None, "pillow_not_installed"
 
-        full_path = Path(media_prefix_str) / image_path
-        if not full_path.exists():
-            return None
+    full_path = Path(media_prefix_str) / image_path
 
+    # Check file exists
+    if not full_path.exists():
+        return None, "file_not_found"
+
+    # Check file is not empty
+    try:
+        file_size = full_path.stat().st_size
+        if file_size == 0:
+            return None, "file_empty"
+        if file_size < 100:  # Suspiciously small for an image
+            return None, "file_too_small"
+    except OSError as e:
+        return None, f"stat_error:{e}"
+
+    try:
         with Image.open(full_path) as img:
-            # Convert to RGB
-            img = img.convert('RGB')
+            # Verify the image can be read (catches truncated files)
+            try:
+                img.verify()
+            except Exception:
+                return None, "image_verify_failed"
+
+        # Re-open after verify (verify() can only be called once)
+        with Image.open(full_path) as img:
+            # Force load to catch truncated/corrupted images
+            try:
+                img.load()
+            except Exception:
+                return None, "image_load_failed"
+
+            # Check image has valid dimensions
+            if img.width < 1 or img.height < 1:
+                return None, "invalid_dimensions"
+
+            # Convert to RGB (handles grayscale, RGBA, palette, etc.)
+            try:
+                img = img.convert('RGB')
+            except Exception:
+                return None, "rgb_convert_failed"
+
             # Resize with high-quality resampling
-            img = img.resize(image_size, Image.LANCZOS)
+            try:
+                img = img.resize(image_size, Image.LANCZOS)
+            except Exception:
+                return None, "resize_failed"
+
             # Convert to numpy array (uint8, RGB)
-            arr = np.array(img, dtype=np.float32)
+            try:
+                arr = np.array(img, dtype=np.float32)
+            except Exception:
+                return None, "numpy_convert_failed"
+
+        # Validate array shape
+        if arr.shape != (image_size[1], image_size[0], 3):
+            return None, f"wrong_shape:{arr.shape}"
 
         # ResNet50 preprocessing (matches keras.applications.resnet50.preprocess_input):
         # 1. Convert RGB to BGR
@@ -83,10 +134,19 @@ def _preprocess_image_for_resnet(args: tuple) -> Optional[np.ndarray]:
         # 2. Zero-center by ImageNet mean
         arr -= IMAGENET_MEAN
 
-        return arr
+        # Final sanity check
+        if not np.isfinite(arr).all():
+            return None, "non_finite_values"
 
-    except Exception:
-        return None
+        return arr, None
+
+    except UnidentifiedImageError:
+        return None, "unidentified_image"
+    except MemoryError:
+        return None, "memory_error"
+    except Exception as e:
+        # Catch-all for unexpected errors
+        return None, f"unexpected:{type(e).__name__}"
 
 
 @dataclass
@@ -113,12 +173,14 @@ class PreparePipeline:
     """Pipeline stage for preparing training dataset.
 
     Fully data-driven - all thresholds computed from actual data.
+    FAILSAFE: Individual image failures do not crash the pipeline.
     """
 
     def __init__(self, settings: Settings):
         self.settings = settings
         self.stats = PipelineStats()
         self.analysis: Optional[DataDrivenAnalysis] = None
+        self._image_error_counts: dict[str, int] = {}  # Tracks image processing failures
 
     def _check_concurrent_access(self) -> bool:
         """Check if another pr0loader process is running."""
@@ -232,14 +294,37 @@ class PreparePipeline:
 
         # =================================================================
         # STEP 6: Embed preprocessed images (always done for training)
+        # FAILSAFE: Individual image failures don't crash the pipeline
         # =================================================================
         print_info(f"Embedding images ({image_size[0]}x{image_size[1]})...")
+
+        items_before_embedding = len(df_result)
         df_embedded = self._embed_images(df_result, image_size)
-        if df_embedded is not None:
-            df_result = df_embedded
-        else:
-            print_error("Image embedding failed - cannot create training dataset")
-            raise RuntimeError("Image embedding failed")
+
+        if df_embedded is None:
+            print_error("Image embedding completely failed - no images could be processed")
+            print_error("Check that:")
+            print_error("  1. Media files exist in the media directory")
+            print_error("  2. Image files are not corrupted")
+            print_error("  3. Pillow is installed: pip install pillow")
+            raise RuntimeError("Image embedding failed: no valid images")
+
+        df_result = df_embedded
+        items_after_embedding = len(df_result)
+
+        # Update stats to reflect actual embedded count
+        self.stats.items_processed = items_after_embedding
+
+        if items_after_embedding < items_before_embedding:
+            dropped = items_before_embedding - items_after_embedding
+            print_warning(
+                f"Dropped {dropped:,} items due to image failures "
+                f"({dropped * 100 / items_before_embedding:.1f}%)"
+            )
+
+        if items_after_embedding == 0:
+            print_error("No items remain after image embedding - cannot create dataset")
+            raise RuntimeError("No valid items for dataset")
 
         # =================================================================
         # STEP 7: Write output
@@ -276,22 +361,23 @@ class PreparePipeline:
         - Tag document frequency (in how many items does the tag appear)
         - Tag confidence distribution (mean, std, percentiles)
         - IDF score (inverse document frequency - rarer = higher)
-        """
-        # Explode tags into rows for vectorized analysis
-        tags_exploded = []
-        for idx, row in df.iterrows():
-            item_id = row['id']
-            for t in row['tags_parsed']:
-                tag_lower = t['tag'].lower().strip()
-                conf = t.get('confidence', 0)
-                tags_exploded.append({
-                    'item_id': item_id,
-                    'tag': tag_lower,
-                    'confidence': conf
-                })
 
-        tags_df = pd.DataFrame(tags_exploded)
+        Uses vectorized pandas operations for performance.
+        """
         total_items = df['id'].nunique()
+
+        # Vectorized tag explosion using pandas explode()
+        # This is much faster than iterrows()
+        df_tags = df[['id', 'tags_parsed']].copy()
+        df_tags = df_tags.explode('tags_parsed').dropna(subset=['tags_parsed'])
+
+        # Extract tag and confidence from the dict column
+        df_tags['tag'] = df_tags['tags_parsed'].apply(lambda t: t['tag'].lower().strip())
+        df_tags['confidence'] = df_tags['tags_parsed'].apply(lambda t: t.get('confidence', 0))
+        df_tags = df_tags.drop(columns=['tags_parsed'])
+        df_tags = df_tags.rename(columns={'id': 'item_id'})
+
+        tags_df = df_tags
 
         print_info(f"Total tag occurrences: {len(tags_df):,}")
 
@@ -497,14 +583,18 @@ class PreparePipeline:
         - Converted RGB -> BGR
         - Zero-centered by ImageNet mean
 
-        The resulting arrays can be fed directly to the model without further preprocessing.
+        FAILSAFE DESIGN:
+        - Individual image failures do NOT crash the pipeline
+        - Failed images are tracked and reported
+        - Only successfully processed images are included in output
 
         Args:
             df: DataFrame with 'image' column containing relative paths
             image_size: Target size (width, height)
 
         Returns:
-            DataFrame with 'image_data' column containing preprocessed float32 arrays
+            DataFrame with 'image_data' column containing preprocessed float32 arrays,
+            or None if no images could be loaded
         """
         try:
             from PIL import Image
@@ -525,46 +615,65 @@ class PreparePipeline:
 
         # Use multiprocessing Pool (bypasses GIL completely)
         # Each worker is a separate process with its own Python interpreter
+        results = []
         progress = create_progress("Embedding")
         with progress:
             task = progress.add_task("[cyan]Processing images...", total=len(args_list))
 
             with mp.Pool(processes=num_workers) as pool:
-                image_arrays = []
                 # Use imap for progress tracking
                 chunksize = max(1, len(args_list) // (num_workers * 4))
                 for result in pool.imap(_preprocess_image_for_resnet, args_list, chunksize=chunksize):
-                    image_arrays.append(result)
+                    results.append(result)
                     progress.update(task, advance=1)
 
-        # Filter out failed loads
-        valid_mask = [arr is not None for arr in image_arrays]
-        valid_count = sum(valid_mask)
-        failed_count = len(valid_mask) - valid_count
+        # Separate successes from failures and collect error statistics
+        valid_mask = []
+        valid_arrays = []
+        error_counts: dict[str, int] = {}
 
+        for i, (arr, error) in enumerate(results):
+            if arr is not None:
+                valid_mask.append(True)
+                valid_arrays.append(arr)
+            else:
+                valid_mask.append(False)
+                error_reason = error or "unknown"
+                error_counts[error_reason] = error_counts.get(error_reason, 0) + 1
+
+        valid_count = len(valid_arrays)
+        failed_count = len(results) - valid_count
+
+        # Report failures with breakdown by reason
         if failed_count > 0:
-            print_warning(f"Failed to load {failed_count:,} images")
+            print_warning(f"Failed to load {failed_count:,} images ({failed_count * 100 / len(results):.1f}%)")
+            # Show top error reasons
+            sorted_errors = sorted(error_counts.items(), key=lambda x: -x[1])
+            for reason, count in sorted_errors[:10]:  # Top 10 reasons
+                print_info(f"  - {reason}: {count:,}")
+            if len(sorted_errors) > 10:
+                others = sum(c for _, c in sorted_errors[10:])
+                print_info(f"  - (other reasons): {others:,}")
 
         if valid_count == 0:
-            print_warning("No images could be loaded!")
+            print_error("No images could be loaded! Check media directory and file integrity.")
             return None
 
         # Keep only rows with valid images
         df = df[valid_mask].copy()
-        valid_arrays = [arr for arr, valid in zip(image_arrays, valid_mask) if valid]
-
-        # Stack into single numpy array for efficient storage
-        # Shape: (N, H, W, 3) - float32
-        stacked = np.stack(valid_arrays, axis=0)
 
         # Store as bytes (numpy array serialized) for Parquet
         # We use tobytes() which is very fast and stores raw float32 data
         df['image_data'] = [arr.tobytes() for arr in valid_arrays]
 
         # Calculate total size
-        total_mb = stacked.nbytes / 1024**2
-        print_info(f"Embedded {len(valid_arrays):,} images ({total_mb:.0f} MB as float32)")
+        total_mb = sum(arr.nbytes for arr in valid_arrays) / 1024**2
+        print_info(f"Embedded {valid_count:,} images ({total_mb:.0f} MB as float32)")
         print_info(f"Array shape per image: {valid_arrays[0].shape}, dtype: {valid_arrays[0].dtype}")
+
+        # Store failure stats for metadata
+        self.stats.items_failed = failed_count
+        self._image_error_counts = error_counts
 
         return df
 
@@ -575,6 +684,7 @@ class PreparePipeline:
             'created': datetime.now().isoformat(),
             'total_items': self.stats.items_processed,
             'items_skipped': self.stats.items_skipped,
+            'items_failed_images': self.stats.items_failed,
             'min_tags': min_tags,
             'unique_tags': self.analysis.unique_tags,
             'total_tag_occurrences': self.analysis.total_tags,
@@ -596,6 +706,8 @@ class PreparePipeline:
                 'color_order': 'BGR',
                 'imagenet_mean': [103.939, 116.779, 123.68],
             },
+            # Image processing error breakdown (for debugging)
+            'image_errors': self._image_error_counts if self._image_error_counts else None,
             # Sample of trash tags with reasons
             'trash_tags_sample': {
                 t: self.analysis.trash_tag_reasons.get(t, 'unknown')
