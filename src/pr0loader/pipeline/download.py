@@ -11,10 +11,10 @@ Architecture (Simple is Fast):
 │     Duration: ~30 seconds for 6M items                           │
 ├──────────────────────────────────────────────────────────────────┤
 │  2. DOWNLOAD PHASE (Async I/O)                                   │
-│     - Feed download list to async workers                        │
-│     - N concurrent downloads with aiohttp                        │
+│     - Token bucket rate limiter (5 req/s for auth content)       │
+│     - N concurrent workers with aiohttp                          │
 │     - Progress bar updates in real-time                          │
-│     Duration: depends on network, ~50 files/sec typical          │
+│     Duration: ~5 files/sec for authenticated (rate limited)      │
 └──────────────────────────────────────────────────────────────────┘
 
 Key optimizations:
@@ -24,6 +24,13 @@ Key optimizations:
 - Minimal object creation (work with raw data)
 - Connection pooling with keep-alive
 - Fibonacci backoff for rate limits (be nice to server)
+
+Rate Limiting (tested 2026-02-17):
+- pr0gramm WAF has DIFFERENT limits for auth vs unauth
+- Unauthenticated (SFW): ~15 req/s OK
+- Authenticated (NSFW/NSFL): ~5 req/s is the limit!
+- On 429: ALL requests blocked for 60-120s cooldown
+- Strategy: Proactive token bucket rate limiter at 5 req/s
 """
 
 from __future__ import annotations
@@ -31,12 +38,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
+import signal
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import aiohttp
 import pandas as pd
@@ -58,11 +66,31 @@ from pr0loader.utils.console import (
     print_stats_table,
     print_success,
     print_info,
-    print_warning,
     console,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# BROWSER-LIKE HEADERS (helps avoid WAF rate limiting)
+# =============================================================================
+
+# pr0gramm's WAF tolerates "typical browser behavior" - use full browser headers
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9,de;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Referer": "https://pr0gramm.com/",
+    "Sec-Fetch-Dest": "image",
+    "Sec-Fetch-Mode": "no-cors",
+    "Sec-Fetch-Site": "same-site",
+    "Sec-CH-UA": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+    "Sec-CH-UA-Mobile": "?0",
+    "Sec-CH-UA-Platform": '"Windows"',
+}
 
 
 # =============================================================================
@@ -222,11 +250,64 @@ def compute_download_list(
 
 
 # =============================================================================
+# RATE LIMITER (Token Bucket)
+# =============================================================================
+
+class TokenBucket:
+    """Token bucket rate limiter for controlling request rate.
+
+    Proactively limits requests to avoid hitting WAF limits.
+    Much better than reacting to 429s after the fact.
+    """
+
+    def __init__(self, rate: float, burst: int = 10):
+        """
+        Args:
+            rate: Tokens per second (requests per second)
+            burst: Maximum burst size (bucket capacity)
+        """
+        self.rate = rate
+        self.burst = burst
+        self._tokens = float(burst)
+        self._last_update = time.time()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> float:
+        """Acquire a token, waiting if necessary.
+
+        Returns: Time waited in seconds
+        """
+        async with self._lock:
+            now = time.time()
+
+            # Refill tokens based on time passed
+            elapsed = now - self._last_update
+            self._tokens = min(self.burst, self._tokens + elapsed * self.rate)
+            self._last_update = now
+
+            if self._tokens >= 1:
+                self._tokens -= 1
+                return 0.0
+
+            # Need to wait for a token
+            wait_time = (1 - self._tokens) / self.rate
+            self._tokens = 0
+            self._last_update = now + wait_time
+
+        await asyncio.sleep(wait_time)
+        return wait_time
+
+
+# =============================================================================
 # ASYNC DOWNLOADER
 # =============================================================================
 
 class AsyncDownloader:
-    """Fast async file downloader with connection pooling."""
+    """Fast async file downloader with connection pooling and rate limiting.
+
+    Uses a token bucket rate limiter to proactively limit requests per second,
+    avoiding WAF rate limits rather than reacting to 429s.
+    """
 
     def __init__(
         self,
@@ -235,20 +316,47 @@ class AsyncDownloader:
         max_concurrent: int = 20,
         max_retries: int = 3,
         max_backoff: float = 60.0,
+        rate_limit: float = 5.0,
+        burst: int = 10,
+        delay_min: float = 0.0,
+        delay_max: float = 0.0,
     ):
         self.base_url = base_url.rstrip('/')
         self.cookies = cookies
         self.max_concurrent = max_concurrent
         self.max_retries = max_retries
         self.max_backoff = max_backoff
+        self.delay_min = delay_min
+        self.delay_max = delay_max
+
+        # Proactive rate limiter - prevents hitting WAF limits
+        self._rate_limiter = TokenBucket(rate=rate_limit, burst=burst)
 
         # Stats
         self.downloaded = 0
         self.failed = 0
         self.bytes_total = 0
 
-        # Rate limiting state
+        # Rate limiting state (TESTED: pr0gramm uses IP-based cooldown)
+        # On 429, ALL requests are blocked for ~60s - no point retrying individual files
         self._backoff_attempt = 0
+        self._consecutive_429s = 0
+        self._global_pause_until: float = 0  # timestamp when we can resume
+        self._cooldown_lock = asyncio.Lock()  # coordinate pause across workers
+
+        # Graceful shutdown support
+        self._shutdown = asyncio.Event()
+        self._setup_signal_handlers()
+
+    def _setup_signal_handlers(self):
+        """Setup signal handlers for graceful shutdown (Ctrl+C)."""
+        def signal_handler(signum, frame):
+            logger.warning("⚠️  Shutdown requested (Ctrl+C) - finishing current downloads...")
+            self._shutdown.set()
+
+        # Register signal handlers
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
 
     async def download_all(
         self,
@@ -278,13 +386,43 @@ class AsyncDownloader:
         async with aiohttp.ClientSession(
             connector=connector,
             cookies=self.cookies,
+            headers=BROWSER_HEADERS,
             timeout=aiohttp.ClientTimeout(total=120, connect=10),
         ) as session:
 
             async def download_one(item: DownloadItem) -> tuple[bool, int]:
                 """Download single file. Returns (success, bytes)."""
+                # Check for shutdown request before starting
+                if self._shutdown.is_set():
+                    return False, 0
+
                 async with semaphore:
+                    # Check if we're in global cooldown (another worker hit 429)
+                    now = time.time()
+                    if self._global_pause_until > now:
+                        wait = self._global_pause_until - now
+                        logger.debug(f"Waiting {wait:.1f}s for global cooldown")
+
+                        # Wait but check for shutdown periodically
+                        try:
+                            await asyncio.wait_for(self._shutdown.wait(), timeout=wait)
+                            return False, 0  # Shutdown requested during wait
+                        except asyncio.TimeoutError:
+                            pass  # Wait completed normally
+
+                    # Proactive rate limiting - wait for token before making request
+                    await self._rate_limiter.acquire()
+
+                    # Check shutdown again after waiting
+                    if self._shutdown.is_set():
+                        return False, 0
+
                     url = f"{self.base_url}/{item.path}"
+
+                    # Add random delay if configured (usually 0)
+                    if self.delay_max > 0:
+                        delay = random.uniform(self.delay_min, self.delay_max)
+                        await asyncio.sleep(delay)
 
                     for attempt in range(self.max_retries):
                         try:
@@ -292,6 +430,7 @@ class AsyncDownloader:
                                 if resp.status == 200:
                                     # Reset backoff on success
                                     self._backoff_attempt = 0
+                                    self._consecutive_429s = 0
 
                                     # Ensure directory exists
                                     item.local_path.parent.mkdir(parents=True, exist_ok=True)
@@ -306,10 +445,29 @@ class AsyncDownloader:
                                     return True, size
 
                                 elif resp.status == 429:
-                                    # Rate limited - backoff
-                                    wait = fibonacci_backoff(self._backoff_attempt, self.max_backoff)
-                                    self._backoff_attempt += 1
-                                    logger.warning(f"Rate limited, waiting {wait:.1f}s")
+                                    # Rate limited - pr0gramm blocks ALL requests for ~60s
+                                    # Trigger global pause - no point other workers retrying
+                                    async with self._cooldown_lock:
+                                        self._consecutive_429s += 1
+                                        self._backoff_attempt += 1
+
+                                        # Check for Retry-After header
+                                        retry_after = resp.headers.get('Retry-After')
+                                        if retry_after and retry_after.isdigit():
+                                            wait = min(float(retry_after), self.max_backoff)
+                                        else:
+                                            # pr0gramm cooldown is ~60s, use at least that
+                                            wait = max(60, fibonacci_backoff(self._backoff_attempt, self.max_backoff))
+
+                                        # Set global pause - affects ALL workers
+                                        self._global_pause_until = time.time() + wait
+
+                                        logger.warning(
+                                            f"🛑 Rate limited (x{self._consecutive_429s}) - "
+                                            f"ALL workers pausing for {wait:.0f}s"
+                                        )
+
+                                    # Wait for cooldown
                                     await asyncio.sleep(wait)
                                     continue
 
@@ -344,16 +502,44 @@ class AsyncDownloader:
             failed = 0
             bytes_total = 0
 
-            for coro in asyncio.as_completed(tasks):
-                success, size = await coro
-                if success:
-                    downloaded += 1
-                    bytes_total += size
-                else:
-                    failed += 1
+            try:
+                for coro in asyncio.as_completed(tasks):
+                    try:
+                        success, size = await coro
+                        if success:
+                            downloaded += 1
+                            bytes_total += size
+                            self.downloaded = downloaded
+                            self.bytes_total = bytes_total
+                        else:
+                            failed += 1
+                            self.failed = failed
 
-                # Update progress
-                progress.update(task_id, advance=1)
+                        # Update progress
+                        progress.update(task_id, advance=1)
+
+                        # Check for shutdown after each completed task
+                        if self._shutdown.is_set():
+                            logger.warning("Cancelling remaining downloads...")
+                            # Cancel all pending tasks
+                            for task in tasks:
+                                if not task.done():
+                                    task.cancel()
+                            break
+
+                    except asyncio.CancelledError:
+                        failed += 1
+                        self.failed = failed
+                        progress.update(task_id, advance=1)
+
+            except KeyboardInterrupt:
+                logger.warning("KeyboardInterrupt in download loop - cancelling tasks...")
+                self._shutdown.set()
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                # Let tasks finish cancelling
+                await asyncio.gather(*tasks, return_exceptions=True)
 
         return downloaded, failed, bytes_total
 
@@ -470,9 +656,10 @@ class DownloadPipeline:
         # PHASE 2: DOWNLOAD
         # =====================================================================
         print_info(f"Phase 2: Downloading {len(items):,} files...")
+        print_info(f"  Rate limit: {self.settings.download_rate_limit:.1f} req/s (burst: {self.settings.download_burst})")
         download_start = time.perf_counter()
 
-        # Create downloader
+        # Create downloader with token bucket rate limiter to avoid WAF limits
         downloader = AsyncDownloader(
             base_url=self.settings.media_base_url,
             cookies={
@@ -482,6 +669,10 @@ class DownloadPipeline:
             max_concurrent=self.max_concurrent,
             max_retries=self.max_retries,
             max_backoff=self.max_backoff,
+            rate_limit=self.settings.download_rate_limit,
+            burst=self.settings.download_burst,
+            delay_min=self.settings.download_delay_min,
+            delay_max=self.settings.download_delay_max,
         )
 
         # Run downloads with progress
@@ -493,9 +684,17 @@ class DownloadPipeline:
                 total=len(items),
             )
 
-            downloaded, failed, bytes_total = asyncio.run(
-                downloader.download_all(items, progress, task_id)
-            )
+            try:
+                downloaded, failed, bytes_total = asyncio.run(
+                    downloader.download_all(items, progress, task_id)
+                )
+            except KeyboardInterrupt:
+                logger.warning("\n⚠️  Download interrupted by user (Ctrl+C)")
+                print_info("\nDownload interrupted - partial results:")
+                # Get partial stats from downloader
+                downloaded = downloader.downloaded
+                failed = downloader.failed
+                bytes_total = downloader.bytes_total
 
         self.stats.downloaded = downloaded
         self.stats.failed = failed

@@ -90,6 +90,26 @@ class Settings(BaseSettings):
         description="Maximum number of parallel metadata requests (for fetch pipeline). Higher = faster on multi-core systems"
     )
 
+    # Download rate limiting (browser-like behavior to avoid WAF)
+    # TESTED 2026-02-17: pr0gramm WAF counts requests per IP per time window.
+    # Authenticated requests have STRICTER limits (~5 req/s) than unauthenticated (~15 req/s)
+    download_rate_limit: float = Field(
+        default=5.0,
+        description="Maximum download requests per second (use 5.0 for authenticated, 15.0 for SFW-only)"
+    )
+    download_burst: int = Field(
+        default=10,
+        description="Burst capacity - how many requests can be sent immediately before rate limiting kicks in"
+    )
+    download_delay_min: float = Field(
+        default=0.0,
+        description="Minimum delay between download requests (0 = no delay, rate limiter handles it)"
+    )
+    download_delay_max: float = Field(
+        default=0.0,
+        description="Maximum delay between download requests (0 = no delay, rate limiter handles it)"
+    )
+
     # Processing
     full_update: bool = Field(default=False, description="Perform full update")
     start_from: Optional[int] = Field(default=None, description="Start from specific ID")

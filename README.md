@@ -6,12 +6,13 @@ A high-performance CLI toolchain for fetching, processing, and training ML model
 
 ## ✨ Features
 
-- 📥 **Fetch** - Download metadata from pr0gramm API with smart rate limiting
-- 📁 **Download** - Batch download media files with parallel loading and async I/O (40-80x faster!)
+- 📥 **Fetch** - Download metadata from pr0gramm API with smart rate limiting and gap detection
+- 📁 **Download V2** - Parallel data loading + async I/O (40-80x faster data phase, graceful shutdown)
 - 📊 **Prepare** - Generate training datasets with embedded, preprocessed images
 - 🧠 **Train** - Train a ResNet50-based tag prediction model
 - 🔮 **Predict** - Predict tags for new images
-- 🎨 **Beautiful CLI** - Rich progress bars and colored output
+- 🎨 **Beautiful CLI** - Rich progress bars, colored output, and real-time stats
+- 🛡️ **Production-Ready** - Validated rate limits, graceful shutdown, comprehensive error handling
 
 ## 🚀 Quick Start
 
@@ -69,13 +70,24 @@ pr0loader predict image.jpg
 pr0loader fetch
 pr0loader fetch --full           # Re-fetch everything
 
-# Download media (now 40-80x faster!)
+# Download media (now 40-80x faster with V2!)
 pr0loader download
 pr0loader download --include-videos
+
+# Features:
+# - Parallel DB + filesystem scanning
+# - Graceful shutdown (single Ctrl+C)
+# - Validated 5 req/s rate limit
+# - Real-time progress with ETA
 
 # Prepare dataset
 pr0loader prepare --output dataset.parquet
 pr0loader prepare --min-tags 3   # Adjust minimum tags
+
+# Export SFW-only dataset for Hugging Face
+pr0loader huggingface-export dataset.parquet --output ./hf_export
+pr0loader huggingface-export dataset.parquet --name your-username/pr0gramm-sfw-tags
+# Note: export is SFW-only and excludes any NSFW/NSFL/NSFP items
 
 # Train model  
 pr0loader train dataset.parquet --epochs 10
@@ -137,12 +149,17 @@ pr0loader --headless --verbose fetch
 
 ## ⚡ Performance Highlights
 
-- **Download Pipeline (V2):** 40-80x faster data loading phase with parallel DB + FS scanning
+- **Download Pipeline V2:** 
+  - 40-80x faster data loading phase (5.8M items in 30-60s)
+  - Parallel DB + filesystem scanning with vectorized pandas operations
+  - Graceful shutdown with single Ctrl+C (clean cancellation of all workers)
+  - Validated 5 req/s rate limit (proven safe for sustained downloads)
 - **Training:** Images pre-embedded and preprocessed for fast repeated training
 - **Scale:** Optimized for millions of images with parallel processing
 - **Memory:** Efficient Parquet storage with embedded float32 image data
+- **Hugging Face Export:** SFW-only filtering with dataset card and train/test splits
 
-See [DOCUMENTATION.md](DOCUMENTATION.md) for technical details and architecture deep-dives.
+See [DOCUMENTATION.md](DOCUMENTATION.md) for technical details and [scripts/IMPLEMENTATION_COMPLETE.md](scripts/IMPLEMENTATION_COMPLETE.md) for the V2 rewrite summary.
 
 ## 🧪 Benchmarks
 
@@ -173,5 +190,3 @@ black src/
 ## 📄 License
 
 MIT License - see [LICENSE](LICENSE) for details.
-
-

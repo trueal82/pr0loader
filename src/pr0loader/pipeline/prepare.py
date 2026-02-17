@@ -719,3 +719,345 @@ class PreparePipeline:
         with open(metadata_path, 'w') as f:
             json.dump(metadata, f, indent=2)
 
+    def export_huggingface(
+        self,
+        source_parquet: Path,
+        output_dir: Path,
+        dataset_name: str = "pr0gramm-sfw-tags",
+        max_samples: Optional[int] = None,
+    ) -> Path:
+        """
+        Export a SFW-only dataset in Hugging Face datasets format.
+
+        IMPORTANT: This export ONLY includes SFW (Safe For Work) content.
+        Any items flagged as NSFW, NSFL, or NSFP are excluded.
+
+        Creates:
+        - data/train.parquet - Training split (90%)
+        - data/test.parquet - Test split (10%)
+        - dataset_dict.json - Dataset metadata
+        - README.md - Dataset card with documentation
+
+        Args:
+            source_parquet: Path to the source parquet file from prepare
+            output_dir: Directory to create the HuggingFace dataset
+            dataset_name: Name for the dataset
+            max_samples: Optional limit on number of samples (for testing)
+
+        Returns:
+            Path to the created dataset directory
+        """
+        print_header(
+            "🤗 Hugging Face Export",
+            "Exporting SFW-only dataset for community sharing"
+        )
+
+        # Load source data
+        print_info(f"Loading source: {source_parquet}")
+        df = pd.read_parquet(source_parquet)
+        total_items = len(df)
+        print_info(f"Total items in source: {total_items:,}")
+
+        # =================================================================
+        # CRITICAL: Filter to SFW ONLY
+        # This is non-negotiable for public sharing
+        # =================================================================
+        print_info("Filtering to SFW content only...")
+
+        # Exclude ANY content that has NSFW, NSFL, or NSFP flags
+        sfw_mask = (
+            (df['is_nsfw'] == False) &
+            (df['is_nsfl'] == False) &
+            (df['is_nsfp'] == False)
+        )
+        df_sfw = df[sfw_mask].copy()
+
+        excluded = total_items - len(df_sfw)
+        print_info(f"SFW items: {len(df_sfw):,} ({len(df_sfw) * 100 / total_items:.1f}%)")
+        print_info(f"Excluded (NSFW/NSFL/NSFP): {excluded:,}")
+
+        if len(df_sfw) == 0:
+            print_error("No SFW items found - cannot create export")
+            raise ValueError("No SFW content available for export")
+
+        # Optional sample limit (for testing)
+        if max_samples and len(df_sfw) > max_samples:
+            df_sfw = df_sfw.sample(n=max_samples, random_state=42)
+            print_info(f"Sampled to {max_samples:,} items")
+
+        # =================================================================
+        # Prepare data for HuggingFace format
+        # =================================================================
+        print_info("Preparing HuggingFace format...")
+
+        # Remove the NSFW flags from export (they're all False anyway)
+        # Keep: id, image, tags, confidences
+        # Convert image_data back to a usable format
+        export_cols = ['id', 'image', 'tags', 'confidences']
+
+        # Check if image_data exists and handle it
+        if 'image_data' in df_sfw.columns:
+            # Convert bytes back to base64 for portability
+            import base64
+            df_sfw['image_bytes_b64'] = df_sfw['image_data'].apply(
+                lambda x: base64.b64encode(x).decode('utf-8') if x else None
+            )
+            export_cols.append('image_bytes_b64')
+
+        df_export = df_sfw[export_cols].copy()
+
+        # Ensure tags and confidences are lists (not numpy arrays)
+        df_export['tags'] = df_export['tags'].apply(
+            lambda x: list(x) if hasattr(x, '__iter__') and not isinstance(x, str) else x
+        )
+        df_export['confidences'] = df_export['confidences'].apply(
+            lambda x: [float(c) for c in x] if hasattr(x, '__iter__') else x
+        )
+
+        # =================================================================
+        # Split into train/test
+        # =================================================================
+        print_info("Creating train/test splits...")
+
+        try:
+            from sklearn.model_selection import train_test_split
+            df_train, df_test = train_test_split(
+                df_export,
+                test_size=0.1,
+                random_state=42
+            )
+        except ImportError:
+            # Fallback: manual split if sklearn not installed
+            print_warning("sklearn not installed, using simple split")
+            df_shuffled = df_export.sample(frac=1, random_state=42)
+            split_idx = int(len(df_shuffled) * 0.9)
+            df_train = df_shuffled.iloc[:split_idx]
+            df_test = df_shuffled.iloc[split_idx:]
+
+        print_info(f"Train: {len(df_train):,} | Test: {len(df_test):,}")
+
+        # =================================================================
+        # Create output directory structure
+        # =================================================================
+        output_dir = Path(output_dir)
+        data_dir = output_dir / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+
+        # Write parquet files
+        print_info("Writing parquet files...")
+        train_path = data_dir / "train.parquet"
+        test_path = data_dir / "test.parquet"
+
+        df_train.to_parquet(train_path, index=False)
+        df_test.to_parquet(test_path, index=False)
+
+        # =================================================================
+        # Create dataset_dict.json (HuggingFace metadata)
+        # =================================================================
+        dataset_dict = {
+            "splits": ["train", "test"],
+            "data_files": {
+                "train": "data/train.parquet",
+                "test": "data/test.parquet"
+            }
+        }
+
+        with open(output_dir / "dataset_dict.json", "w") as f:
+            json.dump(dataset_dict, f, indent=2)
+
+        # =================================================================
+        # Create README.md (Dataset Card)
+        # =================================================================
+        print_info("Creating dataset card...")
+
+        # Collect tag statistics for documentation
+        all_tags = []
+        for tags in df_export['tags']:
+            all_tags.extend(tags)
+        unique_tags = len(set(all_tags))
+
+        readme_content = self._generate_dataset_card(
+            dataset_name=dataset_name,
+            total_samples=len(df_export),
+            train_samples=len(df_train),
+            test_samples=len(df_test),
+            unique_tags=unique_tags,
+            has_image_data='image_bytes_b64' in export_cols,
+        )
+
+        with open(output_dir / "README.md", "w") as f:
+            f.write(readme_content)
+
+        # =================================================================
+        # Done
+        # =================================================================
+        print_stats_table("HuggingFace Export", {
+            "Dataset": dataset_name,
+            "Total samples": f"{len(df_export):,}",
+            "Train split": f"{len(df_train):,}",
+            "Test split": f"{len(df_test):,}",
+            "Unique tags": f"{unique_tags:,}",
+            "Content": "SFW ONLY ✓",
+            "Output": str(output_dir),
+        })
+
+        print_success("HuggingFace export complete! 🤗")
+        print_info(f"Upload with: huggingface-cli upload {dataset_name} {output_dir}")
+
+        return output_dir
+
+    def _generate_dataset_card(
+        self,
+        dataset_name: str,
+        total_samples: int,
+        train_samples: int,
+        test_samples: int,
+        unique_tags: int,
+        has_image_data: bool,
+    ) -> str:
+        """Generate a HuggingFace dataset card (README.md)."""
+
+        card = f'''---
+license: cc-by-nc-4.0
+task_categories:
+  - image-classification
+  - multi-label-classification
+language:
+  - de
+tags:
+  - image-tagging
+  - multi-label
+  - pr0gramm
+  - german
+size_categories:
+  - {"100K<n<1M" if total_samples >= 100000 else "10K<n<100K" if total_samples >= 10000 else "1K<n<10K"}
+---
+
+# {dataset_name}
+
+A dataset of **SFW (Safe For Work) images** with multi-label tags from pr0gramm.com, 
+suitable for training image tagging models.
+
+## ⚠️ Content Notice
+
+**This dataset contains ONLY SFW (Safe For Work) content.**
+
+All images flagged as NSFW, NSFL, or NSFP have been explicitly excluded.
+This dataset is intended for research and educational purposes.
+
+## Dataset Description
+
+- **Total samples:** {total_samples:,}
+- **Train split:** {train_samples:,} (90%)
+- **Test split:** {test_samples:,} (10%)
+- **Unique tags:** {unique_tags:,}
+- **Language:** German (tags are in German)
+
+## Dataset Structure
+
+### Data Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | int | Unique item identifier |
+| `image` | string | Relative image path (original source) |
+| `tags` | list[string] | List of tag labels |
+| `confidences` | list[float] | Confidence scores for each tag |
+{"| `image_bytes_b64` | string | Base64-encoded preprocessed image (224x224, float32, BGR, ImageNet-normalized) |" if has_image_data else ""}
+
+### Splits
+
+| Split | Samples |
+|-------|---------|
+| train | {train_samples:,} |
+| test | {test_samples:,} |
+
+## Usage
+
+```python
+from datasets import load_dataset
+
+# Load from HuggingFace Hub
+dataset = load_dataset("{dataset_name}")
+
+# Or load from local directory
+dataset = load_dataset("parquet", data_dir="path/to/dataset")
+
+# Access data
+for sample in dataset["train"]:
+    print(f"ID: {{sample['id']}}")
+    print(f"Tags: {{sample['tags']}}")
+    print(f"Confidences: {{sample['confidences']}}")
+```
+
+### Decode Image Data
+
+{"" if not has_image_data else '''
+If the dataset includes `image_bytes_b64`, you can decode it:
+
+```python
+import base64
+import numpy as np
+
+def decode_image(b64_string):
+    """Decode base64 image to numpy array."""
+    raw_bytes = base64.b64decode(b64_string)
+    arr = np.frombuffer(raw_bytes, dtype=np.float32)
+    return arr.reshape(224, 224, 3)  # BGR, ImageNet-normalized
+
+# Usage
+img_array = decode_image(sample["image_bytes_b64"])
+```
+'''}
+
+## Preprocessing
+
+Images have been preprocessed for ResNet50:
+- Resized to 224×224
+- Converted to float32
+- RGB → BGR channel order
+- Zero-centered by ImageNet mean [103.939, 116.779, 123.68]
+
+## Intended Use
+
+This dataset is intended for:
+- Training multi-label image classification models
+- Research on image tagging systems
+- Educational purposes
+
+## Limitations
+
+- Tags are user-generated and may contain noise
+- Tag distribution follows a long-tail pattern
+- Language is primarily German
+- Only SFW content is included
+
+## License
+
+This dataset is released under CC-BY-NC-4.0 (Creative Commons Attribution-NonCommercial 4.0).
+
+- ✓ Share and adapt with attribution
+- ✓ Non-commercial use only
+- ✗ No commercial use without permission
+
+## Citation
+
+```bibtex
+@dataset{{{dataset_name.replace("-", "_")}}},
+  title = {{{dataset_name}}},
+  year = {{{datetime.now().year}}},
+  publisher = {{HuggingFace}},
+  note = {{SFW-only image tagging dataset from pr0gramm}}
+}}
+```
+
+## Acknowledgments
+
+Data sourced from pr0gramm.com. This dataset contains only SFW content
+and is created for research/educational purposes.
+
+---
+
+*Generated on {datetime.now().strftime("%Y-%m-%d")} by pr0loader*
+'''
+        return card

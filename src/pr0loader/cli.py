@@ -1217,6 +1217,92 @@ def prepare(
         raise typer.Exit(1)
 
 
+@app.command("huggingface-export")
+def huggingface_export(
+    ctx: typer.Context,
+    source: Path = typer.Argument(..., help="Source Parquet file from 'prepare' command"),
+    output_dir: Path = typer.Option(
+        None, "--output", "-o",
+        help="Output directory for HuggingFace dataset (default: ./huggingface_export)"
+    ),
+    dataset_name: str = typer.Option(
+        "pr0gramm-sfw-tags", "--name", "-n",
+        help="Dataset name for HuggingFace"
+    ),
+    max_samples: Optional[int] = typer.Option(
+        None, "--max-samples", "-m",
+        help="Maximum samples to export (for testing)"
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose logging"),
+    headless: bool = typer.Option(False, "--headless", "-H", help="Run without fancy output"),
+):
+    """🤗 Export SFW-only dataset for HuggingFace Hub.
+
+    Creates a HuggingFace-compatible dataset with:
+    - ONLY SFW (Safe For Work) content
+    - Train/test splits (90/10)
+    - Dataset card (README.md)
+    - Proper metadata
+
+    ⚠️  IMPORTANT: This export EXCLUDES all NSFW, NSFL, and NSFP content.
+
+    Example:
+        pr0loader huggingface-export output/dataset.parquet -o ./hf_dataset
+
+    Then upload to HuggingFace:
+        huggingface-cli upload <your-username>/pr0gramm-sfw-tags ./hf_dataset
+    """
+    # Allow command-level options to override context
+    if verbose or ctx.obj.get("verbose", False):
+        setup_logging(True, headless or ctx.obj.get("headless", False))
+    headless = headless or ctx.obj.get("headless", False)
+
+    if not headless:
+        show_banner()
+
+    # Validate source file exists
+    if not source.exists():
+        print_error(f"Source file not found: {source}")
+        raise typer.Exit(1)
+
+    if not source.suffix == '.parquet':
+        print_error("Source file must be a Parquet file from 'prepare' command")
+        raise typer.Exit(1)
+
+    # Set default output directory
+    if output_dir is None:
+        output_dir = Path("./huggingface_export")
+
+    try:
+        settings = load_settings()
+
+        from pr0loader.pipeline import PreparePipeline
+        pipeline = PreparePipeline(settings)
+
+        result_path = pipeline.export_huggingface(
+            source_parquet=source,
+            output_dir=output_dir,
+            dataset_name=dataset_name,
+            max_samples=max_samples,
+        )
+
+        print_info(f"Dataset exported to: {result_path}")
+        print_info("")
+        print_info("To upload to HuggingFace Hub:")
+        print_info(f"  1. huggingface-cli login")
+        print_info(f"  2. huggingface-cli upload <your-username>/{dataset_name} {result_path}")
+
+    except ValueError as e:
+        print_error(f"Export failed: {e}")
+        raise typer.Exit(1)
+    except Exception as e:
+        print_error(f"Export failed: {e}")
+        if verbose:
+            import traceback
+            traceback.print_exc()
+        raise typer.Exit(1)
+
+
 @app.command()
 def train(
     ctx: typer.Context,

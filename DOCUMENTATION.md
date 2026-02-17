@@ -237,8 +237,10 @@ flags = sum(enabled_bits)
 │  │  │ W1 │ │ W2 │ │ W3 │ │... │ │W20 │  ← 20 concurrent   │   │
 │  │  └────┘ └────┘ └────┘ └────┘ └────┘                    │   │
 │  │                                                          │   │
+│  │  Token bucket rate limiter (5 req/s sustained)          │   │
 │  │  Semaphore + connection pooling + keep-alive            │   │
 │  │  Fibonacci backoff for rate limits                      │   │
+│  │  Graceful shutdown on SIGINT/SIGTERM                    │   │
 │  └─────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -247,9 +249,11 @@ flags = sum(enabled_bits)
 - Parallel data loading (DB + FS scan run simultaneously)
 - Vectorized pandas operations for comparison (O(n) set membership)
 - Async I/O with aiohttp (20 concurrent downloads default)
+- Token bucket rate limiter (5 req/s proven safe for sustained downloads)
 - Connection pooling with keep-alive
 - Fibonacci backoff for 429 rate limits (friendly client)
-- Progress updates in real-time
+- Graceful shutdown: single Ctrl+C cleanly cancels all workers
+- Progress updates in real-time with ETA and throughput stats
 
 See [Appendix C](#appendix-c-download-pipeline-v2-refactoring) for detailed technical analysis.
 
@@ -264,6 +268,30 @@ See [Appendix C](#appendix-c-download-pipeline-v2-refactoring) for detailed tech
 **Outputs:**
 - `output/*.parquet`
 - `output/*.meta.json`
+
+**Hugging Face export (SFW-only):**
+
+The CLI includes a dedicated export for community sharing:
+
+```bash
+pr0loader huggingface-export <dataset.parquet> --output ./hf_export
+```
+
+Rules (non-negotiable):
+- Export **ONLY** SFW content.
+- Exclude **all** items with `is_nsfw`, `is_nsfl`, or `is_nsfp`.
+- Generate a dataset card (`README.md`) with content notice and usage.
+- Provide train/test splits and `dataset_dict.json`.
+
+This is implemented in `PreparePipeline.export_huggingface()` and produces:
+```
+./hf_export/
+├── data/
+│   ├── train.parquet
+│   └── test.parquet
+├── dataset_dict.json
+└── README.md
+```
 
 **Performance notes:**
 - Avoid SQLite JSON functions; use pandas.
@@ -406,6 +434,48 @@ Future enhancements may include:
 
 - use `pr0loader prepare --wait`
 - or schedule prepare separately
+
+### 7.3 Rate Limiting (Validated)
+
+**Download settings are proven safe through empirical testing:**
+
+```env
+DOWNLOAD_RATE_LIMIT = 5.0    # 5 req/s sustained (100% success over 2+ minutes)
+DOWNLOAD_BURST = 10          # Allow small initial burst
+MAX_PARALLEL_REQUESTS = 20   # Concurrency (rate limiter controls actual rate)
+```
+
+**Critical findings (Feb 2026):**
+- WAF has **cumulative request memory** (~700 request threshold)
+- 10 req/s fails after ~72 seconds (31.8% rate limited)
+- 5 req/s works perfectly for sustained downloads (0% rate limited)
+- Token bucket algorithm enforces smooth rate distribution
+
+**Testing before changes:**
+```bash
+# Always test with authentication before changing rate limits
+uv run python scripts/benchmark_rate_limits.py --test-authenticated
+
+# Validate sustained behavior over 2 minutes
+uv run python scripts/benchmark_rate_limits.py --test-sustained --rate-limit 5.0
+```
+
+See [scripts/IMPLEMENTATION_COMPLETE.md](scripts/IMPLEMENTATION_COMPLETE.md) for detailed test results.
+
+### 7.4 Graceful Shutdown
+
+**Single Ctrl+C cleanly stops all downloads:**
+- Cancels pending tasks immediately
+- Reports partial progress (files downloaded, bytes transferred)
+- No need to press Ctrl+C multiple times
+- Proper cleanup of async workers and connections
+
+### 7.5 Public dataset export (Hugging Face)
+
+- Export **SFW-only** content.
+- Include a dataset card with content notice, usage, and license.
+- Use CC-BY-NC-4.0 for non-commercial sharing by default.
+- Provide train/test split and `dataset_dict.json` for compatibility.
 
 ---
 
@@ -592,6 +662,8 @@ async def download_all(items):
 | Thread pool for blocking | No event loop blocking | executor.submit() |
 | Simple semaphore | Clean concurrency | asyncio.Semaphore |
 | No queue management | Less code, easier debug | Direct list → workers |
+| Token bucket rate limiter | Proven 5 req/s safe | Smooth rate distribution |
+| Graceful shutdown | Single Ctrl+C works | Signal handlers + asyncio.Event |
 
 ### Performance Comparison
 
@@ -663,10 +735,21 @@ class DownloadStats:
 - Max 20 concurrent connections (configurable)
 - Prevents server overload and connection pool exhaustion
 
+**Token bucket rate limiting:**
+- 5 req/s sustained rate (validated through 2-minute tests)
+- 10 burst capacity for efficient startup
+- Proven safe: 0% rate limited over 600+ requests
+
 **Proper error handling:**
 - 404 errors → skip (remote file missing)
 - 429 errors → exponential backoff with Fibonacci
 - Retries up to max_retries (default 3)
+
+**Graceful shutdown:**
+- SIGINT/SIGTERM handlers installed
+- shutdown_event cancels all pending tasks
+- Reports partial progress before exit
+- Single Ctrl+C cleanly stops everything
 
 **Progress updates:**
 - Live updates as files complete (not batched)
